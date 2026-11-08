@@ -11,7 +11,7 @@ import os
 import re
 import time
 
-from services import ollama
+from . import ollama
 
 _CACHE: dict[tuple, tuple[float, str]] = {}
 try:

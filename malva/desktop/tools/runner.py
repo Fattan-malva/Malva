@@ -4,7 +4,19 @@ import json
 import os
 import re
 
-from core.task_engine import request_cancel
+# Cancellation state
+_CANCEL_REQUESTED = False
+
+def request_cancel():
+    global _CANCEL_REQUESTED
+    _CANCEL_REQUESTED = True
+
+def is_cancelled():
+    return _CANCEL_REQUESTED
+
+def reset_cancel():
+    global _CANCEL_REQUESTED
+    _CANCEL_REQUESTED = False
 
 from . import (
     browser,

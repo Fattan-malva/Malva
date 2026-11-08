@@ -1,1577 +1,438 @@
-import os
-os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--autoplay-policy=no-user-gesture-required"
+"""
+app.py — Malva Desktop Entry Point (v1.0.0).
 
+Rebranded and evolved from Nana.
+Runs directly with: python app.py (no venv required).
+
+Architecture:
+- pywebview frameless, always-on-top, draggable floating pill
+- Dynamic window resizing (Compact: 440x62, Expanded: 440x440, Sleeping: 175x46)
+- MalvaSession (audio -> faster-whisper ASR -> SQLite -> AI Orchestrator)
+- Non-blocking startup with in-settings ASR model management
+- 100% SVG icon UI (no emojis/unicode symbol hacks)
+"""
+
+from __future__ import annotations
+
+import os
 import sys
 
-# Console Windows kadang memakai cp1252; tanpa ini, print teks Unicode
-# (judul lagu, em dash, emoji) bisa melempar UnicodeEncodeError.
-for _stream in (sys.stdout, sys.stderr):
+# Ensure UTF-8 output on Windows console
+for _s in (sys.stdout, sys.stderr):
     try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
+        _s.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 
+# Force WebView2 arguments before import
+os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (
+    "--autoplay-policy=no-user-gesture-required --enable-features=msOverlayScrollbar"
+)
+# Silence HuggingFace symlinks warning on non-dev Windows
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
+import ctypes
 import json
-import re
-import wave
 import threading
 import time
+from pathlib import Path
 
-import numpy as np
-import pyaudio
-import httpx
-import speech_recognition as sr
-import webview
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from tools import browser, runner, web  # noqa: E402  (setelah .env dimuat)
-from tools.registry import system_prompt  # noqa: E402
-from core.task_engine import TaskEngine, is_cancelled, reset_cancel  # noqa: E402
+import webview
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "https://ollama.com/v1/chat/completions")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:31b-cloud")
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
+# Malva core imports
+from malva.asr.router import ASRRouter
+from malva.desktop.gateway import DesktopGateway
+from malva.privacy.manager import PrivacyManager
+from malva.shell.session import MODES, MalvaSession, SessionState
+from malva.storage import db
+from malva.ui.html import PILL_HTML
 
-HEADERS = {"Content-Type": "application/json"}
-if OLLAMA_API_KEY:
-    HEADERS["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+# ------------------------------------------------------------------ configuration
 
-TOOLS_ENABLED = os.getenv("TOOLS_ENABLED", "true").strip().lower() in (
-    "1", "true", "yes", "on",
-)
+LOCAL_APP_DATA = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "Malva"
+LOCAL_APP_DATA.mkdir(parents=True, exist_ok=True)
+DB_PATH = LOCAL_APP_DATA / "malva.db"
+
+# Idle sleep timer
 try:
-    TOOLS_MAX_STEPS = max(0, min(25, int(os.getenv("TOOLS_MAX_STEPS", "8") or 8)))
+    SLEEP_AFTER_SECONDS = float(os.getenv("SLEEP_AFTER_SECONDS", "60") or 60)
 except ValueError:
-    TOOLS_MAX_STEPS = 8
+    SLEEP_AFTER_SECONDS = 60.0
 
-# --- Mode tidur: berapa detik tanpa pertanyaan sebelum NANA tidur (0 = nonaktif) ---
-try:
-    SLEEP_AFTER_SECONDS = float(os.getenv("SLEEP_AFTER_SECONDS", "30") or 0)
-except ValueError:
-    SLEEP_AFTER_SECONDS = 30.0
+WAKE_WORD = (os.getenv("WAKE_WORD", "MALVA") or "MALVA").strip().upper()
 
-# --- Kata yang diucapkan untuk membangunkan NANA ---
-WAKE_WORD = (os.getenv("WAKE_WORD", "NANA") or "NANA").strip()
+# Window dimensions
+WIN_W_COMPACT = 440
+WIN_H_COMPACT = 62
 
+WIN_W_EXPANDED = 440
+WIN_H_EXPANDED = 450
 
-def build_wake_pattern(word):
-    letters = [re.escape(c) for c in re.sub(r"[^a-z0-9]", "", word.lower())]
-    if not letters:
-        return None
-    # toleran terhadap pemisahan suku kata, mis. "NA NA"
-    return r"\b" + r"\s*".join(letters) + r"\b"
+WIN_W_SLEEP = 175
+WIN_H_SLEEP = 46
 
 
-WAKE_PATTERN = build_wake_pattern(WAKE_WORD)
+# ------------------------------------------------------------------ JS API
 
-# Ukuran jendela saat tidur (tombol panah di tepi kiri layar)
-SLEEP_WIN_W = 44
-SLEEP_WIN_H = 62
+class MalvaAPI:
+    """Python API exposed to the pywebview JavaScript context."""
 
-CHUNK = 1024
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-RATE = 16000
+    def __init__(self, app: "MalvaApp"):
+        self._app = app
 
-# VAD parameters
-SPEECH_THRESHOLD = 100
-SILENCE_THRESHOLD = 40
-SILENCE_DURATION = 1.2
-WAIT_SPEECH_TIMEOUT = 10.0
-MAX_RECORD_DURATION = 15.0
+    def ui_ready(self) -> None:
+        """Called by JS when the page has fully loaded."""
+        self._app.on_ui_ready()
 
-p = pyaudio.PyAudio()
-window = None
+    def set_panel_state(self, state: str) -> None:
+        """Dynamically resize window based on UI state (compact/expanded/sleeping)."""
+        self._app.set_panel_state(state)
 
-HTML = r"""<!DOCTYPE html>
-<html lang="id">
-<head>
-    <meta charset="UTF-8">
-    <title>Nana</title>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        html, body {
-            width: 100%; height: 100%;
-            overflow: hidden;
-            font-family: 'Inter', sans-serif;
-            background: #000000;
-            color: #f8fafc;
-            user-select: none;
-            -webkit-user-select: none;
-        }
+    def send_text(self, text: str) -> None:
+        """User typed a prompt or query into the input field."""
+        self._app.handle_user_text(text)
 
-        #app {
-            width: 100%; height: 100%;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: flex-start;
-            padding: 8px 18px;
-            gap: 6px;
-        }
+    def pause_session(self) -> None:
+        self._app.session.pause()
 
-        /* ---- Stage: wadah tetap untuk spectrum & thinking (crossfade di satu tempat) ---- */
-        #stage {
-            position: relative;
-            width: 100%;
-            height: 84px;
-            flex-shrink: 0;
-            transition: height 0.3s ease, margin 0.3s ease;
-        }
-        #stage.collapsed {
-            height: 0;
-            margin-bottom: -6px;
-        }
+    def resume_session(self) -> None:
+        self._app.session.resume()
 
-        /* ---- Spectrum 5 bar ---- */
-        #spectrum {
-            position: absolute;
-            inset: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 10px;
-            transition: opacity 0.35s ease, transform 0.35s ease, visibility 0.35s;
-        }
-        #spectrum.hidden-state {
-            opacity: 0;
-            transform: scale(0.94);
-            visibility: hidden;
-            pointer-events: none;
-        }
+    def emergency_stop(self) -> None:
+        self._app.session.stop()
 
-        .bar {
-            width: 12px;
-            min-height: 8px;
-            border-radius: 999px;
-            background: linear-gradient(to top, #6366f1, #22d3ee);
-            box-shadow: 0 0 12px rgba(99, 102, 241, 0.55);
-            transition: height 0.05s linear, background 0.2s;
-        }
-        #spectrum.listening .bar {
-            background: linear-gradient(to top, #f43f5e, #fbbf24);
-            box-shadow: 0 0 14px rgba(244, 63, 94, 0.6);
-        }
+    def change_mode(self, mode: str) -> None:
+        if mode in MODES:
+            self._app.switch_mode(mode)
 
-        /* ---- Thinking: 3 titik bouncing sederhana ---- */
-        #thinking {
-            position: absolute;
-            inset: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 10px;
-            opacity: 0;
-            transform: scale(0.94);
-            visibility: hidden;
-            pointer-events: none;
-            transition: opacity 0.35s ease, transform 0.35s ease, visibility 0.35s;
-        }
-        #thinking.show {
-            opacity: 1;
-            transform: scale(1);
-            visibility: visible;
-        }
-        #thinking .dot {
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            background: #818cf8;
-            box-shadow: 0 0 10px rgba(99, 102, 241, 0.7);
-            animation: bounce 1.2s ease-in-out infinite;
-        }
-        #thinking .dot:nth-child(1) { animation-delay: 0s; }
-        #thinking .dot:nth-child(2) { animation-delay: 0.15s; }
-        #thinking .dot:nth-child(3) { animation-delay: 0.3s; }
+    def enable_focus_mode(self) -> None:
+        self._app.session.enable_focus_mode()
 
-        @keyframes bounce {
-            0%, 60%, 100% { transform: translateY(0); opacity: 0.5; }
-            30% { transform: translateY(-10px); opacity: 1; }
-        }
+    def disable_focus_mode(self) -> None:
+        self._app.session.disable_focus_mode()
 
-        /* ---- Action status (ikon Lucide CDN, tanpa emoji) ---- */
-        #action {
-            display: none;
-            align-items: center;
-            gap: 7px;
-            width: 100%;
-            flex-shrink: 0;
-            padding: 2px 2px 0;
-            font-size: 11.5px;
-            color: #94a3b8;
-            white-space: nowrap;
-            overflow: hidden;
-        }
-        #action.show { display: flex; animation: fadeIn 0.18s ease-out; }
-        #action .ico {
-            flex: 0 0 auto;
-            width: 13px;
-            height: 13px;
-            background: #a5b4fc;
-            -webkit-mask-repeat: no-repeat;
-            -webkit-mask-position: center;
-            -webkit-mask-size: contain;
-            mask-repeat: no-repeat;
-            mask-position: center;
-            mask-size: contain;
-        }
-        #action .label {
-            overflow: hidden;
-            text-overflow: ellipsis;
-        }
-        #action.busy .ico { animation: spin 0.9s linear infinite; }
-        #action.error { color: #fbbf24; }
-        #action.error .ico { background: #fbbf24; }
-        #action.done .ico { background: #34d399; }
-        @keyframes spin { to { transform: rotate(360deg); } }
+    def enable_hidden_mode(self) -> None:
+        status = self._app.privacy.enable_hidden_mode()
+        self._app.js(f"window.updateHiddenMode('{status.value}')")
 
-        /* ---- Answer ---- */
-        #answer {
-            display: none;
-            width: 100%;
-            font-size: 13px;
-            font-weight: 400;
-            color: #e2e8f0;
-            text-align: left;
-            line-height: 1.55;
-            word-break: break-word;
-            overflow-wrap: anywhere;
-            white-space: normal;
-            padding: 0 2px;
-        }
-        #answer.show { display: block; animation: fadeIn 0.2s ease-out; }
+    def disable_hidden_mode(self) -> None:
+        self._app.privacy.disable_hidden_mode()
+        self._app.js("window.updateHiddenMode('disabled')")
 
-        #answer.scrolling {
-            overflow-y: auto;
-            overflow-x: hidden;
-            padding-right: 6px;
-        }
-        #answer.scrolling::-webkit-scrollbar { width: 4px; }
-        #answer.scrolling::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 2px; }
-        #answer.scrolling::-webkit-scrollbar-track { background: transparent; }
-
-        /* Markdown */
-        #answer p { margin: 4px 0; }
-        #answer code {
-            background: #1e293b;
-            color: #fbbf24;
-            padding: 1px 5px;
-            border-radius: 4px;
-            font-family: 'Consolas', 'Courier New', monospace;
-            font-size: 12px;
-        }
-        #answer pre {
-            background: #1e293b;
-            padding: 10px;
-            border-radius: 6px;
-            overflow-x: auto;
-            margin: 6px 0;
-            border-left: 3px solid #6366f1;
-        }
-        #answer pre code { padding: 0; background: none; color: #e2e8f0; }
-        #answer ul, #answer ol { padding-left: 22px; margin: 4px 0; }
-        #answer li { margin: 2px 0; }
-        #answer strong { color: #c7d2fe; font-weight: 600; }
-        #answer em { color: #a5b4fc; }
-        #answer a { color: #818cf8; text-decoration: underline; }
-        #answer h1, #answer h2, #answer h3 {
-            margin: 8px 0 4px;
-            color: #c7d2fe;
-            font-size: 14px;
-            font-weight: 600;
-        }
-        #answer blockquote {
-            border-left: 3px solid #4b5563;
-            padding-left: 8px;
-            color: #94a3b8;
-            margin: 4px 0;
-            font-style: italic;
-        }
-        #answer hr { border: none; border-top: 1px solid #334155; margin: 6px 0; }
-        #answer table { border-collapse: collapse; margin: 6px 0; font-size: 12px; }
-        #answer th, #answer td { border: 1px solid #334155; padding: 4px 8px; }
-        #answer th { background: #1e293b; color: #c7d2fe; }
-
-        /* Cursor */
-        #answer .cursor {
-            display: inline-block;
-            color: #818cf8;
-            font-weight: bold;
-            width: 8px;
-        }
-        #answer .cursor::before {
-            content: '▊';
-            animation: blink 0.8s step-end infinite;
-        }
-        #answer .err-text { color: #fbbf24; font-weight: 500; }
-
-        @keyframes blink { 50% { opacity: 0; } }
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(3px); }
-            to   { opacity: 1; transform: translateY(0); }
-        }
-
-        /* ---- Mode tidur: jendela kecil di tepi kiri, tanpa border, ikon ZZZ ---- */
-        body.sleeping #app { display: none; }
-        #wakeBtn {
-            position: fixed;
-            inset: 0;
-            display: none;
-            align-items: center;
-            justify-content: center;
-            padding: 0;
-            border: none;
-            outline: none;
-            background: #000000;
-            color: #a5b4fc;
-            cursor: pointer;
-        }
-        body.sleeping #wakeBtn { display: flex; }
-        #wakeBtn:hover { color: #e0e7ff; background: #0d0d16; }
-
-        /* ZZZ animasi: tiga huruf Z naik bergantian */
-        #wakeBtn .zzz {
-            position: relative;
-            width: 30px;
-            height: 38px;
-        }
-        #wakeBtn .zzz span {
-            position: absolute;
-            font-family: 'Inter', sans-serif;
-            font-weight: 700;
-            line-height: 1;
-            color: currentColor;
-            opacity: 0;
-            text-shadow: 0 0 9px rgba(99, 102, 241, 0.55);
-            animation: zzzFloat 2.6s ease-in-out infinite;
-        }
-        #wakeBtn .zzz span:nth-child(1) {
-            left: 0; bottom: 1px; font-size: 11px; animation-delay: 0s;
-        }
-        #wakeBtn .zzz span:nth-child(2) {
-            left: 8px; bottom: 10px; font-size: 15px; animation-delay: 0.4s;
-        }
-        #wakeBtn .zzz span:nth-child(3) {
-            left: 16px; bottom: 20px; font-size: 20px; animation-delay: 0.8s;
-        }
-        @keyframes zzzFloat {
-            0%   { opacity: 0;   transform: translate(0, 5px) scale(0.75); }
-            20%  { opacity: 1;   transform: translate(1px, 2px) scale(0.95); }
-            70%  { opacity: 0.85; transform: translate(4px, -6px) scale(1); }
-            100% { opacity: 0;   transform: translate(7px, -12px) scale(1.1); }
-        }
-    </style>
-</head>
-<body>
-    <button id="wakeBtn" type="button" title="Bangunkan NANA" aria-label="Bangunkan NANA">
-        <span class="zzz" aria-hidden="true">
-            <span>Z</span><span>Z</span><span>Z</span>
-        </span>
-    </button>
-    <div id="app">
-        <div id="stage">
-            <div id="spectrum">
-                <div class="bar"></div>
-                <div class="bar"></div>
-                <div class="bar"></div>
-                <div class="bar"></div>
-                <div class="bar"></div>
-            </div>
-            <div id="thinking">
-                <div class="dot"></div>
-                <div class="dot"></div>
-                <div class="dot"></div>
-            </div>
-        </div>
-        <div id="action">
-            <span class="ico" id="actionIcon"></span>
-            <span class="label" id="actionLabel"></span>
-        </div>
-        <div id="answer"></div>
-    </div>
-
-    <script>
-        const stage = document.getElementById('stage');
-        const spectrum = document.getElementById('spectrum');
-        const bars = spectrum.querySelectorAll('.bar');
-        const thinking = document.getElementById('thinking');
-        const answerEl = document.getElementById('answer');
-        const actionEl = document.getElementById('action');
-        const actionIcon = document.getElementById('actionIcon');
-        const actionLabel = document.getElementById('actionLabel');
-
-        let rawAnswer = '';
-        let typedLen = 0;
-        let typeTimer = null;
-        let lastW = 220, lastH = 100;
-
-        const W_LISTEN  = 220;
-        const W_ANSWER  = 400;   // lebih sempit, tinggi memanjang sampai batas layar
-        const H_LISTEN  = 100;
-        const SPECTRUM_H = 84;
-        const PADDING_V = 20;
-        const MAX_H_RATIO = 0.92;
-        const TYPE_SPEED_MS = 16;
-        const TYPE_CHARS_PER_TICK = 2;
-        const RENDER_EVERY_N_TICKS = 4;
-        const MIN_THINK_MS = 1200;
-
-        let tickCount = 0;
-        let isListening = false;
-        let doneSoundPlayed = false;
-        let thinkingShownAt = 0;
-        let hideTimer = null;
-
-        marked.setOptions({ breaks: true, gfm: true });
-
-        // ===== Sound effects (Web Audio, tanpa file eksternal) =====
-        let audioCtx = null;
-        let pendingSpawn = null;
-
-        function getAudio() {
-            try {
-                if (!audioCtx) {
-                    const AC = window.AudioContext || window.webkitAudioContext;
-                    if (!AC) return null;
-                    audioCtx = new AC();
-                }
-                return audioCtx;
-            } catch (e) {
-                return null;
-            }
-        }
-
-        // Jalankan suara hanya setelah AudioContext benar-benar running
-        function withAudio(fn, queueIfBlocked) {
-            const ctx = getAudio();
-            if (!ctx) return;
-            if (ctx.state === 'running') {
-                try { fn(ctx); } catch (e) {}
-                return;
-            }
-            let settled = false;
-            const giveUp = setTimeout(() => {
-                if (settled) return;
-                settled = true;
-                if (queueIfBlocked) pendingSpawn = fn;
-            }, 400);
-            ctx.resume().then(() => {
-                clearTimeout(giveUp);
-                if (settled) return;
-                settled = true;
-                if (ctx.state === 'running') {
-                    try { fn(ctx); } catch (e) {}
-                }
-            }).catch(() => {
-                clearTimeout(giveUp);
-                if (settled) return;
-                settled = true;
-                if (queueIfBlocked) pendingSpawn = fn;
-            });
-        }
-
-        function playTone(ctx, o) {
-            const type = o.type || 'sine';
-            const peak = o.peak ?? 0.2;
-            const attack = o.attack ?? 0.01;
-            const t0 = o.t0;
-            const dur = o.dur;
-
-            const osc = ctx.createOscillator();
-            const g = ctx.createGain();
-            osc.type = type;
-            osc.frequency.setValueAtTime(o.freq, t0);
-            if (o.freqEnd) {
-                osc.frequency.exponentialRampToValueAtTime(o.freqEnd, t0 + dur);
-            }
-            g.gain.setValueAtTime(0.0001, t0);
-            g.gain.exponentialRampToValueAtTime(peak, t0 + attack);
-            g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
-
-            osc.connect(g);
-            g.connect(ctx.destination);
-            osc.start(t0);
-            osc.stop(t0 + dur + 0.05);
-        }
-
-        function playBell(ctx, freq, t0, peak) {
-            // parsial inharmonik supaya terdengar seperti lonceng
-            playTone(ctx, { type: 'sine', freq: freq,        t0: t0, dur: 0.9,  peak: peak,        attack: 0.005 });
-            playTone(ctx, { type: 'sine', freq: freq * 2.76, t0: t0, dur: 0.5,  peak: peak * 0.25, attack: 0.005 });
-            playTone(ctx, { type: 'sine', freq: freq * 5.4,  t0: t0, dur: 0.25, peak: peak * 0.10, attack: 0.005 });
-        }
-
-        // Saat listening dimulai: sweep naik + kilau nada tinggi
-        function playSpawnSound(ctx) {
-            const t = ctx.currentTime + 0.02;
-            playTone(ctx, { type: 'sine',     freq: 260, freqEnd: 1400, t0: t, dur: 0.45, peak: 0.12, attack: 0.08 });
-            playTone(ctx, { type: 'triangle', freq: 390, freqEnd: 2100, t0: t, dur: 0.45, peak: 0.05, attack: 0.10 });
-            [1568, 2093, 2637].forEach((f, i) => {
-                playTone(ctx, { type: 'sine', freq: f, t0: t + 0.28 + i * 0.06, dur: 0.35, peak: 0.09, attack: 0.005 });
-            });
-        }
-
-        // Saat jawaban selesai diketik: dua denting lonceng berurutan
-        function playDoneSound(ctx) {
-            const t = ctx.currentTime + 0.02;
-            playBell(ctx, 1047, t,        0.16);
-            playBell(ctx, 1568, t + 0.13, 0.20);
-        }
-
-        // Setiap klik/tekan tombol memastikan audio aktif, dan memutar suara yang sempat tertahan
-        function unlockAudio() {
-            const ctx = getAudio();
-            if (!ctx) return;
-            const go = () => {
-                if (pendingSpawn && ctx.state === 'running') {
-                    const f = pendingSpawn;
-                    pendingSpawn = null;
-                    try { f(ctx); } catch (e) {}
-                }
-            };
-            if (ctx.state === 'running') go();
-            else ctx.resume().then(go).catch(() => {});
-        }
-        document.addEventListener('pointerdown', unlockAudio, true);
-        document.addEventListener('keydown', unlockAudio, true);
-
-        // ===== Helpers =====
-        function escapeHtml(s) {
-            return String(s).replace(/[&<>"']/g, c => ({
-                '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
-            }[c]));
-        }
-
-        // ===== Status aksi (ikon dari Lucide CDN, tanpa emoji) =====
-        const ICON_CDN = 'https://cdn.jsdelivr.net/npm/lucide-static@1.61.0/icons/';
-        const ACTION_ICONS = {
-            app: 'app-window',
-            terminal: 'terminal',
-            keyboard: 'keyboard',
-            key: 'command',
-            command: 'square-terminal',
-            focus: 'focus',
-            globe: 'globe',
-            folder: 'folder-open',
-            list: 'layout-list',
-            timer: 'timer',
-            busy: 'loader-2',
-            check: 'check',
-            blocked: 'shield-alert'
-        };
-
-        function setActionIcon(name) {
-            const file = ACTION_ICONS[name] || ACTION_ICONS.app;
-            const url = 'url("' + ICON_CDN + file + '.svg")';
-            actionIcon.style.webkitMaskImage = url;
-            actionIcon.style.maskImage = url;
-        }
-
-        window.showAction = function (icon, label) {
-            setActionIcon('busy');
-            actionLabel.textContent = label || 'Bekerja...';
-            actionEl.classList.add('show', 'busy');
-            actionEl.classList.remove('done', 'error');
-        };
-
-        window.finishAction = function (ok, label) {
-            actionEl.classList.remove('busy');
-            actionEl.classList.toggle('done', !!ok);
-            actionEl.classList.toggle('error', !ok);
-            setActionIcon(ok ? 'check' : 'blocked');
-            if (label) actionLabel.textContent = label;
-        };
-
-        window.hideAction = function () {
-            actionEl.classList.remove('show', 'busy', 'done', 'error');
-        };
-
-        function maxWindowHeight() {
-            return Math.floor(window.screen.availHeight * MAX_H_RATIO);
-        }
-
-        function currentStageH() {
-            return stage.classList.contains('collapsed') ? 0 : SPECTRUM_H;
-        }
-
-        function resize(w, h, force) {
-            if (!window.pywebview?.api?.resize) return;
-            const maxH = maxWindowHeight();
-            h = Math.min(h, maxH);
-            if (!force && Math.abs(w - lastW) < 4 && Math.abs(h - lastH) < 6) return;
-            lastW = w; lastH = h;
-            window.pywebview.api.resize(w, h);
-        }
-
-        function measureAnswerHeight() {
-            if (!answerEl.classList.contains('show')) return 0;
-            return answerEl.scrollHeight || 0;
-        }
-
-        function updateAnswerSize() {
-            if (!window.pywebview?.api?.resize) return;
-            const stageH = currentStageH();
-            const actionH = actionEl.classList.contains('show') ? (actionEl.offsetHeight + 6) : 0;
-            const ansH = measureAnswerHeight();
-            const maxH = maxWindowHeight();
-            const neededH = stageH + actionH + PADDING_V + ansH + 12;
-
-            if (neededH <= maxH) {
-                answerEl.classList.remove('scrolling');
-                answerEl.style.maxHeight = '';
-                resize(W_ANSWER, Math.max(H_LISTEN, neededH), false);
-            } else {
-                answerEl.classList.add('scrolling');
-                const innerMax = maxH - stageH - actionH - PADDING_V - 20;
-                answerEl.style.maxHeight = innerMax + 'px';
-                resize(W_ANSWER, maxH, false);
-                answerEl.scrollTop = answerEl.scrollHeight;
-            }
-        }
-
-        // ===== Thinking show / hide =====
-        function showThinking() {
-            clearTimeout(hideTimer);
-            hideTimer = null;
-            if (!thinking.classList.contains('show')) {
-                thinkingShownAt = performance.now();
-            }
-            stage.classList.remove('collapsed');
-            spectrum.classList.add('hidden-state');
-            spectrum.classList.remove('listening');
-            thinking.classList.add('show');
-        }
-
-        // thinking baru hilang setelah typewriter selesai dan minimal MIN_THINK_MS terlewati
-        function hideThinking() {
-            clearTimeout(hideTimer);
-            const wait = Math.max(0, MIN_THINK_MS - (performance.now() - thinkingShownAt));
-            hideTimer = setTimeout(() => {
-                hideTimer = null;
-                thinking.classList.remove('show');
-                stage.classList.add('collapsed');
-                setTimeout(() => {
-                    if (answerEl.classList.contains('show')) updateAnswerSize();
-                }, 320);
-            }, wait);
-        }
-
-        // Dipanggil Python: true jika masih ada proses (typewriter / thinking) yang berjalan
-        window.isBusy = function () {
-            return typeTimer !== null || hideTimer !== null || thinking.classList.contains('show');
-        };
-
-        // ===== Audio bars =====
-        window.updateBars = function (levels) {
-            for (let i = 0; i < bars.length; i++) {
-                const h = Math.max(8, Math.min(84, (levels[i] || 0)));
-                bars[i].style.height = h + 'px';
-            }
-        };
-
-        // ===== Back to listening (keep previous answer) =====
-        window.setListening = function () {
-            clearTimeout(hideTimer);
-            hideTimer = null;
-            window.hideAction();
-
-            stage.classList.remove('collapsed');
-            spectrum.classList.remove('hidden-state');
-            spectrum.classList.add('listening');
-            thinking.classList.remove('show');
-            bars.forEach(b => b.style.height = '8px');
-
-            // suara spawn hanya saat transisi dari non-listening ke listening
-            if (!isListening) {
-                isListening = true;
-                withAudio(playSpawnSound, true);
-            }
-
-            answerEl.classList.remove('err');
-
-            clearInterval(typeTimer);
-            typeTimer = null;
-
-            if (rawAnswer) {
-                answerEl.innerHTML = marked.parse(rawAnswer);
-                answerEl.classList.add('show', 'done');
-                updateAnswerSize();
-            } else {
-                answerEl.innerHTML = '';
-                answerEl.classList.remove('show', 'done', 'scrolling');
-                answerEl.style.maxHeight = '';
-                resize(W_LISTEN, H_LISTEN, true);
-            }
-        };
-
-        // ===== Processing: SEMBUNYIKAN spectrum, TAMPILKAN thinking =====
-        window.startProcessing = function () {
-            isListening = false;
-            showThinking();
-            resize(W_LISTEN, H_LISTEN, true);
-        };
-
-        // ===== New answer =====
-        window.startAnswer = function () {
-            isListening = false;
-            window.hideAction();
-            showThinking(); // thinking tetap tampil selama typewriter berjalan
-
-            rawAnswer = '';
-            typedLen = 0;
-            tickCount = 0;
-            doneSoundPlayed = false;
-            clearInterval(typeTimer);
-            typeTimer = null;
-
-            answerEl.innerHTML = '<span class="cursor"></span>';
-            answerEl.classList.add('show');
-            answerEl.classList.remove('err', 'done', 'scrolling');
-            answerEl.style.maxHeight = '';
-            resize(W_ANSWER, H_LISTEN + 30, true);
-        };
-
-        // ===== Token masuk =====
-        window.appendAnswer = function (text) {
-            if (!text) return;
-            if (actionEl.classList.contains('show')) window.hideAction();
-            rawAnswer += text;
-            if (!typeTimer) startTypewriter();
-        };
-
-        // ===== Typewriter markdown live =====
-        function startTypewriter() {
-            typeTimer = setInterval(() => {
-                let changed = false;
-
-                if (typedLen < rawAnswer.length) {
-                    typedLen = Math.min(rawAnswer.length, typedLen + TYPE_CHARS_PER_TICK);
-                    changed = true;
-                }
-
-                tickCount++;
-                if (changed && (tickCount % RENDER_EVERY_N_TICKS === 0 || typedLen >= rawAnswer.length)) {
-                    const partial = rawAnswer.slice(0, typedLen);
-                    answerEl.innerHTML = marked.parse(partial) + '<span class="cursor"></span>';
-                }
-
-                if (changed) {
-                    updateAnswerSize();
-                }
-
-                if (typedLen >= rawAnswer.length) {
-                    clearInterval(typeTimer);
-                    typeTimer = null;
-                    if (answerEl.classList.contains('done')) {
-                        finalizeAnswer();
-                    }
-                }
-            }, TYPE_SPEED_MS);
-        }
-
-        // ===== Stream selesai =====
-        window.endAnswer = function () {
-            answerEl.classList.add('done');
-            if (!typeTimer) finalizeAnswer();
-        };
-
-        function finalizeAnswer() {
-            // typewriter sudah selesai → thinking dihentikan, lalu bunyi selesai
-            hideThinking();
-
-            if (!rawAnswer) {
-                answerEl.innerHTML = '';
-                answerEl.classList.remove('show');
-                return;
-            }
-
-            if (!doneSoundPlayed) {
-                doneSoundPlayed = true;
-                withAudio(playDoneSound, false);
-            }
-
-            answerEl.innerHTML = marked.parse(rawAnswer);
-            answerEl.classList.add('done');
-            requestAnimationFrame(() => {
-                setTimeout(() => {
-                    updateAnswerSize();
-                    if (answerEl.classList.contains('scrolling')) {
-                        answerEl.scrollTop = answerEl.scrollHeight;
-                    }
-                }, 20);
-            });
-        }
-
-        // ===== Error =====
-        window.showError = function (msg) {
-            clearInterval(typeTimer);
-            typeTimer = null;
-            clearTimeout(hideTimer);
-            hideTimer = null;
-            isListening = false;
-            window.hideAction();
-
-            stage.classList.remove('collapsed');
-            thinking.classList.remove('show');
-            spectrum.classList.remove('hidden-state');
-            answerEl.innerHTML = '<div class="err-text">⚠ ' + escapeHtml(msg) + '</div>';
-            answerEl.classList.add('show', 'err');
-            answerEl.classList.remove('done', 'scrolling');
-            answerEl.style.maxHeight = '';
-            resize(W_ANSWER, H_LISTEN + 40, true);
-        };
-
-        // ===== Mode tidur / bangun =====
-        const wakeBtn = document.getElementById('wakeBtn');
-        wakeBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            unlockAudio();
-            if (window.pywebview?.api?.wake) window.pywebview.api.wake();
-            else document.body.classList.remove('sleeping');
-        });
-
-        window.enterSleepUI = function () {
-            clearInterval(typeTimer);
-            typeTimer = null;
-            clearTimeout(hideTimer);
-            hideTimer = null;
-            window.hideAction();
-            isListening = false;
-            rawAnswer = '';
-            typedLen = 0;
-            tickCount = 0;
-            doneSoundPlayed = false;
-            answerEl.innerHTML = '';
-            answerEl.classList.remove('show', 'done', 'err', 'scrolling');
-            answerEl.style.maxHeight = '';
-            stage.classList.remove('collapsed');
-            thinking.classList.remove('show');
-            spectrum.classList.add('hidden-state');
-            spectrum.classList.remove('listening');
-            bars.forEach(b => b.style.height = '8px');
-            document.body.classList.add('sleeping');
-        };
-
-        window.wakeUI = function () {
-            document.body.classList.remove('sleeping');
-            lastW = 0;
-            lastH = 0;
-            window.setListening();
-        };
-
-        document.getElementById('app').addEventListener('click', () => {});
-        window.addEventListener('load', () => resize(W_LISTEN, H_LISTEN, true));
-    </script>
-</body>
-</html>
-"""
-
-class Api:
-    def __init__(self):
-        self._window = None
-        self._running = True
-        self._loop_thread = None
-        self._sleeping = False
-        self._last_activity = time.time()
-        self._prev_xy = None
-        self._history = []
-        self._task_engine = TaskEngine()
-        self._current_task = None
-        # True setelah terminal VS Code dibuka pada request yang sama:
-        # type_text diblokir supaya perintah tidak "nyasar" ke terminal.
-        self._terminal_guard = False
-
-    def set_window(self, w):
-        self._window = w
-
-    def resize(self, w, h):
-        # saat tidur ukuran jendela dikendalikan oleh mode tidur
-        if self._sleeping:
-            return "ok"
+    def enable_system_audio(self) -> None:
         try:
-            self._window.resize(int(w), int(h))
-        except Exception:
-            pass
-        return "ok"
-
-    def _js(self, code):
-        for _ in range(3):
-            try:
-                self._window.evaluate_js(code)
-                return
-            except Exception:
-                time.sleep(0.15)
-
-    def _js_get(self, code):
-        try:
-            return self._window.evaluate_js(code)
-        except Exception:
-            return None
-
-    def _send_levels(self, levels):
-        self._js(f"window.updateBars({json.dumps(levels)})")
-
-    # Tunggu sampai typewriter dan thinking di UI selesai sebelum kembali ke listening
-    def _wait_idle(self, timeout=90.0):
-        end = time.time() + timeout
-        time.sleep(0.1)
-        while self._running and time.time() < end:
-            busy = self._js_get("window.isBusy()")
-            if not busy:
-                return
-            time.sleep(0.1)
-
-    # ---------------- Mode tidur / bangun ----------------
-    def _screen(self):
-        try:
-            s = webview.screens[0]
-            return int(s.x), int(s.y), int(s.width), int(s.height)
-        except Exception:
-            return 0, 0, 1536, 864
-
-    # Jendela mengecil dan menempel di tepi kiri layar, hanya tombol panah
-    def _enter_sleep(self):
-        if self._sleeping or self._window is None:
-            return
-        print("[sleep] tidak ada pertanyaan, NANA tidur")
-        self._sleeping = True
-        try:
-            self._prev_xy = (int(self._window.x), int(self._window.y))
-        except Exception:
-            self._prev_xy = None
-        try:
-            self._window.on_top = True
-            self._js("window.enterSleepUI()")
-            self._window.resize(SLEEP_WIN_W, SLEEP_WIN_H)
-            sx, sy, sw, sh = self._screen()
-            self._window.move(sx, sy + max(0, (sh - SLEEP_WIN_H) // 2))
+            self._app.session._audio.start_system_audio()
+            self._app.sync_sources()
         except Exception as e:
-            print(f"[sleep] {e}")
+            self._app.js(f"window.showAction('error', '{e}')")
 
-    def _wake_up(self):
-        if not self._sleeping:
-            return
-        print("[sleep] NANA bangun")
-        self._sleeping = False
-        self._last_activity = time.time()
-        try:
-            self._window.on_top = True
-            if self._prev_xy:
-                self._window.move(*self._prev_xy)
-        except Exception:
-            pass
-        self._js("window.wakeUI()")
+    def disable_system_audio(self) -> None:
+        from malva.audio.capture import TrackSource
+        self._app.session._audio.stop_track(TrackSource.SYSTEM_AUDIO)
+        self._app.sync_sources()
 
-    # Dipanggil tombol panah di UI
-    def wake(self):
-        self._wake_up()
-        return "ok"
+    def set_asr_language(self, lang: str) -> None:
+        self._app.database.set_setting("asr_language", lang)
+        self._app.asr_router.language = lang
+        self._app.sync_asr_status()
 
-    @staticmethod
-    def _norm_text(text):
-        return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+    def get_asr_catalog(self) -> list[dict]:
+        """Return available models and their download/active status."""
+        return self._app.asr_router.get_models_catalog()
 
-    def _contains_wake_word(self, text):
-        if not WAKE_PATTERN or not text:
-            return False
-        return re.search(WAKE_PATTERN, self._norm_text(text)) is not None
+    def download_and_load_model(self, model_size: str) -> None:
+        """Download or activate a specific Whisper model."""
+        self._app.asr_router.load_model_async(model_size)
 
-    def _strip_wake_word(self, text):
-        norm = self._norm_text(text)
-        if WAKE_PATTERN:
-            norm = re.sub(WAKE_PATTERN, " ", norm)
-        return " ".join(norm.split())
+    def wake_from_sleep(self) -> None:
+        self._app.wake()
 
-    # Selama tidur mic tetap mendengarkan wake word ("NANA")
-    def _sleep_listen(self):
-        frames = self._record_vad(send_levels=False, abort=lambda: not self._sleeping)
-        if not self._running or not self._sleeping or not frames:
-            return
-
-        text = self._transcribe(frames)
-        if not text:
-            return
-        print(f"[sleep] terdengar: {text!r}")
-
-        if not self._contains_wake_word(text):
-            return
-
-        rest = self._strip_wake_word(text)
-        self._wake_up()
-
-        # Kalau wake word diucapkan bersama pertanyaan, langsung jawab.
-        if len(rest) >= 2:
-            print(f"[sleep] pertanyaan langsung: {rest!r}")
-            self._last_activity = time.time()
-            self._js("window.startProcessing()")
-            self._js("window.startAnswer()")
-            self._stream_llm(rest)
-            self._js("window.endAnswer()")
-            self._wait_idle()
-            self._last_activity = time.time()
-
-    # ---------------- Auto loop ----------------
-    def start_auto(self):
-        if self._loop_thread and self._loop_thread.is_alive():
-            return "already_running"
-        self._running = True
-        self._loop_thread = threading.Thread(target=self._loop, daemon=True)
-        self._loop_thread.start()
-        return "ok"
-
-    def stop_auto(self):
-        self._running = False
-        return "ok"
-
-    def _loop(self):
-        time.sleep(1.5)
-        print("[loop] started")
-        self._last_activity = time.time()
-
-        while self._running:
+    def start_drag(self) -> None:
+        """Windows native drag support via SendMessage."""
+        if self._app.window:
             try:
-                # tidur kalau sudah lama tidak ada pertanyaan
-                if (SLEEP_AFTER_SECONDS > 0
-                        and time.time() - self._last_activity >= SLEEP_AFTER_SECONDS):
-                    self._enter_sleep()
-
-                if self._sleeping:
-                    self._sleep_listen()
-                    continue
-
-                self._js("window.setListening()")
-                print("[loop] listening...")
-                frames = self._record_vad()
-
-                if not self._running:
-                    break
-                if not frames:
-                    continue
-
-                self._last_activity = time.time()
-                print(f"[loop] speech detected: {len(frames)} chunks "
-                      f"(~{len(frames)*CHUNK/RATE:.1f}s)")
-
-                self._js("window.startProcessing()")
-                text = self._transcribe(frames)
-                print(f"[loop] transcribed: {text!r}")
-
-                if not text:
-                    # tidak ada transkripsi -> jawaban lama tetap tampil
-                    time.sleep(0.8)
-                    continue
-
-                low = text.lower()
-                if "batalkan" in low or "cancel" in low or "batal" in low:
-                    reset_cancel()
-                    from core.task_engine import request_cancel as _rc
-                    _rc()
-                    if self._current_task is not None:
-                        self._current_task.status = "cancelled"
-                    self._js("window.startAnswer()")
-                    self._emit("Tugas dibatalkan.")
-                    self._js("window.endAnswer()")
-                    self._wait_idle()
-                    self._last_activity = time.time()
-                    time.sleep(1.0)
-                    continue
-
-                self._js("window.startAnswer()")
-                ok = self._stream_llm(text)
-                if not ok:
-                    print("[loop] stream fallback failed")
-                self._js("window.endAnswer()")
-
-                # tunggu typewriter & thinking selesai dulu, baru kembali ke listening
-                self._wait_idle()
-                if not self._running:
-                    break
-
-                # jawaban tetap tampil, tidak dihapus
-                self._last_activity = time.time()
-                time.sleep(1.0)
-            except Exception as e:
-                print(f"[loop error] {type(e).__name__}: {e}")
-                import traceback
-                traceback.print_exc()
-                time.sleep(1.0)
-
-    # ---------------- VAD ----------------
-    def _open_stream(self):
-        for rate in (RATE, 44100, 48000):
-            try:
-                stream = p.open(format=FORMAT, channels=CHANNELS,
-                                rate=rate, input=True,
-                                frames_per_buffer=CHUNK)
-                return stream, rate
-            except Exception as e:
-                print(f"[mic] rate {rate} failed: {e}")
-                continue
-        return None, RATE
-
-    def _record_vad(self, send_levels=True, abort=None):
-        stream, rate = self._open_stream()
-        if stream is None:
-            if not self._sleeping:
-                self._js("window.showError('mic tidak bisa dibuka - cek izin Windows Privacy')")
-            time.sleep(3.0)
-            return []
-
-        frames = []
-        pre_buffer = []
-        pre_max = 15
-        start_t = time.time()
-        speech_started = False
-        above_count = 0
-        silence_count = 0
-        silence_needed = int(SILENCE_DURATION * rate / CHUNK)
-        min_frames = int(0.25 * rate / CHUNK)
-        chunk_idx = 0
-
-        try:
-            while self._running:
-                if abort and abort():
-                    break
-
-                elapsed = time.time() - start_t
-                if elapsed > MAX_RECORD_DURATION:
-                    break
-                if not speech_started and elapsed > WAIT_SPEECH_TIMEOUT:
-                    if send_levels:
-                        print("[vad] timeout, no speech")
-                    break
-
-                try:
-                    data = stream.read(CHUNK, exception_on_overflow=False)
-                except Exception as e:
-                    print(f"[mic read] {e}")
-                    break
-
-                audio = np.frombuffer(data, dtype=np.int16).astype(np.float32)
-                rms = float(np.sqrt(np.mean(audio ** 2)))
-
-                chunk_idx += 1
-                if send_levels and chunk_idx % 16 == 0 and not speech_started:
-                    print(f"[audio] rms={rms:.0f} (speech need >{SPEECH_THRESHOLD})")
-
-                # ---- spectrum ----
-                if send_levels:
-                    seg = max(1, len(audio) // 5)
-                    levels = []
-                    for i in range(5):
-                        ch = audio[i * seg:(i + 1) * seg]
-                        if len(ch) == 0:
-                            levels.append(8)
-                            continue
-                        r = float(np.sqrt(np.mean(ch ** 2)))
-                        lvl = min(84, 8 + np.sqrt(r) * 3.5)
-                        levels.append(round(lvl, 1))
-                    self._send_levels(levels)
-
-                # ---- VAD ----
-                if not speech_started:
-                    pre_buffer.append(data)
-                    if len(pre_buffer) > pre_max:
-                        pre_buffer.pop(0)
-                    if rms > SPEECH_THRESHOLD:
-                        above_count += 1
-                        if above_count >= 3:
-                            speech_started = True
-                            frames = list(pre_buffer)
-                            pre_buffer = []
-                            print(f"[vad] speech started at rms={rms:.0f}")
-                    else:
-                        above_count = 0
-                else:
-                    frames.append(data)
-                    if rms < SILENCE_THRESHOLD:
-                        silence_count += 1
-                        if silence_count >= silence_needed:
-                            print("[vad] silence detected, done")
-                            break
-                    else:
-                        silence_count = 0
-        finally:
-            try:
-                stream.stop_stream()
-                stream.close()
+                user32 = ctypes.windll.user32
+                hwnd = self._app.get_hwnd()
+                if hwnd:
+                    user32.ReleaseCapture()
+                    user32.SendMessageW(hwnd, 0x0112, 0xF012, 0)
             except Exception:
                 pass
 
-        if not speech_started or len(frames) < min_frames:
-            return []
-        return frames
+    def update_action_status(self, item_id: str, status: str) -> None:
+        self._app.database.update_action_item_status(item_id, status)
 
-    # ---------------- Transkripsi ----------------
-    def _transcribe(self, frames):
+
+# ------------------------------------------------------------------ Application
+
+class MalvaApp:
+    def __init__(self):
+        # 1. Initialize SQLite
+        db.init(DB_PATH)
+        self.database = db.get_db()
+
+        # 2. Privacy Manager
+        self.privacy = PrivacyManager(on_status_change=self._on_privacy_status)
+
+        # 3. Desktop Tool Gateway
+        tools_enabled = os.getenv("TOOLS_ENABLED", "true").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        self.desktop = DesktopGateway(
+            session_id="",
+            db=self.database,
+            tools_enabled=tools_enabled,
+        )
+
+        # 4. ASR Router (non-blocking async startup)
+        saved_lang = self.database.get_setting("asr_language", "auto")
+        self.asr_router = ASRRouter(
+            model_size="small",
+            device="cpu",
+            compute_type="int8",
+            language=saved_lang,
+            auto_load=True,
+        )
+        self.asr_router.set_status_callback(self._on_asr_status_update)
+
+        # 5. Active Session (default: assistant)
+        self.session: MalvaSession = None  # type: ignore
+        self.current_mode = "assistant"
+        self._create_session("assistant")
+
+        # UI state
+        self.window: webview.Window | None = None
+        self._api = MalvaAPI(self)
+        self._last_active_time = time.time()
+        self._is_sleeping = False
+        self._panel_state = "compact"
+        self._idle_thread: threading.Thread | None = None
+
+    # ------------------------------------------------------------------ window sizing
+
+    def set_panel_state(self, state: str) -> None:
+        self._panel_state = state
+        if not self.window:
+            return
         try:
-            with wave.open("temp.wav", "wb") as wf:
-                wf.setnchannels(CHANNELS)
-                wf.setsampwidth(p.get_sample_size(FORMAT))
-                wf.setframerate(RATE)
-                wf.writeframes(b"".join(frames))
-        except Exception as e:
-            print(f"[wav] {e}")
-            return ""
-
-        for attempt in range(2):
-            try:
-                r = sr.Recognizer()
-                with sr.AudioFile("temp.wav") as source:
-                    audio = r.record(source)
-                try:
-                    return r.recognize_google(audio, language="id-ID")
-                except Exception as e1:
-                    print(f"[stt id] {e1}")
-                    try:
-                        return r.recognize_google(audio)
-                    except Exception as e2:
-                        print(f"[stt] {e2}")
-            except Exception as e:
-                print(f"[sr] {e}")
-            if attempt == 0:
-                time.sleep(0.5)
-        return ""
-
-    # ---------------- Streaming LLM + tools ----------------
-    def _emit(self, text):
-        if text:
-            self._js(f"window.appendAnswer({json.dumps(text)})")
-
-    def _messages_for(self, text):
-        # Info realtime (berita/harga/cuaca/dll) disuntikkan otomatis kalau
-        # pertanyaannya butuh data terbaru dan laptop punya akses internet.
-        try:
-            extra = web.realtime_context(text)
-        except Exception as e:
-            print(f"[web] context dilewati: {type(e).__name__}: {e}")
-            extra = ""
-        messages = [{"role": "system", "content": system_prompt(extra)}]
-        messages.extend(self._history[-8:])
-        messages.append({"role": "user", "content": text})
-        return messages
-
-    @staticmethod
-    def _parse_action(text):
-        raw = (text or "").strip()
-        if not raw:
-            return None
-        if raw.startswith("```"):
-            raw = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw).strip()
-        try:
-            obj, _ = json.JSONDecoder().raw_decode(raw)
+            if state == "expanded":
+                self.window.resize(WIN_W_EXPANDED, WIN_H_EXPANDED)
+            elif state == "sleeping":
+                self.window.resize(WIN_W_SLEEP, WIN_H_SLEEP)
+            else:
+                self.window.resize(WIN_W_COMPACT, WIN_H_COMPACT)
         except Exception:
-            return None
-        name = obj.get("tool") if isinstance(obj, dict) else None
-        if isinstance(name, str):
-            name = re.sub(r"\s*\([^)]*\)\s*$", "", name.strip())
-        if isinstance(name, str) and name:
-            args = obj.get("args")
-            return {"tool": name, "args": args if isinstance(args, dict) else {}}
+            pass
+
+    # ------------------------------------------------------------------ session
+
+    def _create_session(self, mode: str) -> None:
+        if self.session:
+            self.session.stop()
+        self.current_mode = mode
+        self.session = MalvaSession(
+            mode=mode,
+            db=self.database,
+            asr_router=self.asr_router,
+            desktop=self.desktop,
+            privacy=self.privacy,
+            on_event=self._on_session_event,
+        )
+        self.desktop.session_id = self.session.session_id
+
+    def switch_mode(self, mode: str) -> None:
+        self._create_session(mode)
+        self.session.start()
+        self.js(f"window.updateMode('{mode}')")
+        self.sync_sources()
+
+    # ------------------------------------------------------------------ UI events
+
+    def _on_session_event(self, event: dict) -> None:
+        etype = event.get("type", "")
+
+        if etype == "state_change":
+            state = event.get("state", "idle")
+            self.js(f"window.updateState('{state}')")
+
+        elif etype == "transcript_segment":
+            data = event.get("data", {})
+            self.js(f"window.addTranscriptSegment({json.dumps(data)})")
+            self._reset_idle_timer()
+
+        elif etype == "ai_chunk":
+            text = event.get("text", "")
+            self.js(f"window.appendAnswer({json.dumps(text)})")
+            self._reset_idle_timer()
+
+        elif etype == "audio_levels":
+            levels = event.get("levels", [])
+            self.js(f"window.updateBars({json.dumps(levels)})")
+
+        elif etype == "focus_mode":
+            active = event.get("enabled", False)
+            self.js(f"window.updateFocusMode({json.dumps(active)})")
+
+        elif etype == "sleep_mode":
+            sleeping = event.get("sleeping", False)
+            self.js(f"window.setSleeping({json.dumps(sleeping)})")
+            self.set_panel_state("sleeping" if sleeping else "compact")
+
+        elif etype == "voice_input_text":
+            text = event.get("text", "")
+            self.js(f"window.showVoiceText({json.dumps(text)})")
+
+        elif etype == "meeting_report":
+            data = event.get("data", {})
+            for d in data.get("decisions", []):
+                self.js(f"window.addDecision({json.dumps(d)})")
+            for item in data.get("action_items", []):
+                self.js(f"window.addActionItem({json.dumps(item)})")
+
+        elif etype == "interview_report":
+            report = event.get("data", {})
+            self.js(f"window.appendAnswer({json.dumps(report.get('report', ''))})")
+
+    def _on_privacy_status(self, component: str, status: str) -> None:
+        if component == "hidden_mode":
+            self.js(f"window.updateHiddenMode('{status}')")
+
+    def _on_asr_status_update(self, data: dict) -> None:
+        self.js(f"window.onASRStatusUpdate({json.dumps(data)})")
+        self.sync_asr_status()
+
+    # ------------------------------------------------------------------ interactions
+
+    def handle_user_text(self, text: str) -> None:
+        self._reset_idle_timer()
+        threading.Thread(target=self._ask_worker, args=(text,), daemon=True).start()
+
+    def _ask_worker(self, text: str) -> None:
+        self.js("window.startAnswer()")
+
+        def on_chunk(chunk: str) -> None:
+            self.js(f"window.appendAnswer({json.dumps(chunk)})")
+
+        full_text = self.session.ask(text, on_chunk=on_chunk)
+        self.js("window.endAnswer()")
+
+    # ------------------------------------------------------------------ sleep / idle
+
+    def _reset_idle_timer(self) -> None:
+        self._last_active_time = time.time()
+        if self._is_sleeping:
+            self.wake()
+
+    def _idle_monitor(self) -> None:
+        while True:
+            time.sleep(5)
+            if SLEEP_AFTER_SECONDS <= 0:
+                continue
+            if self.session.focus_mode:
+                # Focus Mode suppresses sleep (Blueprint §7)
+                continue
+            if not self._is_sleeping:
+                idle = time.time() - self._last_active_time
+                if idle >= SLEEP_AFTER_SECONDS:
+                    self.sleep()
+
+    def sleep(self) -> None:
+        self._is_sleeping = True
+        self.session.enter_sleep()
+        self.set_panel_state("sleeping")
+        self.js("window.setSleeping(true)")
+
+    def wake(self) -> None:
+        self._is_sleeping = False
+        self._last_active_time = time.time()
+        self.session.exit_sleep()
+        self.set_panel_state("compact")
+        self.js("window.setSleeping(false)")
+
+    # ------------------------------------------------------------------ sync helpers
+
+    def sync_sources(self) -> None:
+        sources = [s.value for s in self.session._audio.active_sources]
+        self.js(f"window.updateSources({json.dumps(sources)})")
+
+    def sync_asr_status(self) -> None:
+        info = self.asr_router.model_info
+        catalog = self.asr_router.get_models_catalog()
+        payload = {"info": info, "catalog": catalog}
+        self.js(f"window.updateASRStatus({json.dumps(payload)})")
+
+    def _apply_native_styling(self) -> None:
+        hwnd = self.get_hwnd()
+        if hwnd:
+            try:
+                dwm = ctypes.windll.dwmapi
+                # DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2
+                corner_pref = ctypes.c_int(2)
+                dwm.DwmSetWindowAttribute(hwnd, 33, ctypes.byref(corner_pref), ctypes.sizeof(corner_pref))
+                # DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+                dark_mode = ctypes.c_int(1)
+                dwm.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark_mode), ctypes.sizeof(dark_mode))
+            except Exception as e:
+                print(f"[win32] styling error: {e}")
+
+    def on_ui_ready(self) -> None:
+        hwnd = self.get_hwnd()
+        if hwnd:
+            self.privacy.set_window_handle(hwnd)
+            self._apply_native_styling()
+
+        self.js(f"window.updateMode('{self.current_mode}')")
+        self.sync_asr_status()
+        self.sync_sources()
+        self.session.start()
+
+        # Start idle monitor thread
+        self._idle_thread = threading.Thread(target=self._idle_monitor, daemon=True)
+        self._idle_thread.start()
+
+    def get_hwnd(self) -> int | None:
+        if self.window:
+            try:
+                return int(self.window.native.Handle.ToInt64())
+            except Exception:
+                try:
+                    user32 = ctypes.windll.user32
+                    return user32.FindWindowW(None, "Malva")
+                except Exception:
+                    pass
         return None
 
-    def _request_once(self, messages):
-        try:
-            with httpx.Client(timeout=120.0) as client:
-                resp = client.post(
-                    OLLAMA_URL,
-                    headers=HEADERS,
-                    json={
-                        "model": OLLAMA_MODEL,
-                        "messages": messages,
-                        "stream": False,
-                    },
-                )
-                resp.raise_for_status()
-                return resp.json()["choices"][0]["message"]["content"]
-        except Exception as e:
-            print(f"[fallback] {e}")
-            return None
+    def js(self, script: str) -> None:
+        if self.window:
+            try:
+                self.window.evaluate_js(script)
+            except Exception:
+                pass
 
-    def _llm_round(self, messages):
-        """Satu panggilan LLM. Return (teks_yang_sudah_diemit, action|None)."""
-        emitted = []
-        buffered = ""
-        mode = None
-        got_any = False
+    # ------------------------------------------------------------------ launch
 
-        def emit(chunk):
-            if chunk:
-                emitted.append(chunk)
-                self._emit(chunk)
+    def run(self) -> None:
+        self.window = webview.create_window(
+            title="Malva",
+            html=PILL_HTML,
+            width=WIN_W_COMPACT,
+            height=WIN_H_COMPACT,
+            frameless=True,
+            on_top=True,
+            background_color="#000000",
+            transparent=False,
+            js_api=self._api,
+            easy_drag=False,  # Managed via native Win32 start_drag()
+        )
+        webview.start(debug=False)
 
-        def classify():
-            nonlocal buffered, mode
-            stripped = buffered.lstrip()
-            if not stripped:
-                return
-            if stripped.startswith("```"):
-                if "\n" in stripped:
-                    first, rest = stripped.split("\n", 1)
-                    info = first[3:].strip().lower()
-                    if info in ("", "json") and rest.lstrip().startswith("{"):
-                        mode = "action"
-                    else:
-                        mode = "text"
-                        emit(buffered)
-                        buffered = ""
-                elif len(stripped) > 16:
-                    mode = "text"
-                    emit(buffered)
-                    buffered = ""
-            elif stripped.startswith("{"):
-                # kandidat aksi; ditahan sampai JSON selesai
-                mode = "action"
-            else:
-                mode = "text"
-                emit(buffered)
-                buffered = ""
 
-        headers = {**HEADERS, "Accept": "text/event-stream"}
-        try:
-            with httpx.Client(timeout=120.0) as client:
-                with client.stream(
-                    "POST",
-                    OLLAMA_URL,
-                    headers=headers,
-                    json={
-                        "model": OLLAMA_MODEL,
-                        "messages": messages,
-                        "stream": True,
-                    },
-                ) as resp:
-                    resp.raise_for_status()
-                    for raw in resp.iter_lines():
-                        if not self._running:
-                            break
-                        if not raw:
-                            continue
-                        line = raw.strip()
-                        if not line.startswith("data:"):
-                            continue
-                        payload = line[5:].strip()
-                        if payload == "[DONE]":
-                            break
-                        try:
-                            obj = json.loads(payload)
-                            delta = obj["choices"][0]["delta"].get("content")
-                        except Exception:
-                            continue
-                        if not delta:
-                            continue
-
-                        got_any = True
-                        if mode is None:
-                            buffered += delta
-                            classify()
-                        elif mode == "text":
-                            emit(delta)
-                        else:
-                            buffered += delta
-        except Exception as e:
-            print(f"[stream] {e}")
-
-        if got_any:
-            if mode == "action":
-                action = self._parse_action(buffered)
-                if action:
-                    return "".join(emitted), action
-                emit(buffered)
-            elif mode is None and buffered:
-                action = self._parse_action(buffered)
-                if action:
-                    return "".join(emitted), action
-                emit(buffered)
-            return "".join(emitted), None
-
-        # ---- fallback non-streaming ----
-        print("[stream] fallback ke non-streaming")
-        answer = self._request_once(messages)
-        if answer is None:
-            return "".join(emitted), None
-
-        action = self._parse_action(answer)
-        if action:
-            return "", action
-        emit(answer)
-        return "".join(emitted), None
-
-    def _stream_llm(self, message):
-        if not OLLAMA_URL:
-            self._emit("OLLAMA_URL belum diset di .env")
-            return False
-
-        messages = self._messages_for(message)
-        emitted_any = False
-        final_text = ""
-        self._terminal_guard = False
-        reset_cancel()
-        self._current_task = self._task_engine.create(message)
-        self._task_engine.set_plan(self._current_task.task_id, [])
-
-        last_signature = None
-        repeat_count = 0
-
-        for step in range(TOOLS_MAX_STEPS + 1):
-            if is_cancelled():
-                msg = "Tugas dibatalkan."
-                self._emit(msg)
-                emitted_any = True
-                final_text += msg
-                if self._current_task is not None:
-                    self._current_task.status = "cancelled"
-                break
-            emitted, action = self._llm_round(messages)
-            if emitted:
-                emitted_any = True
-                final_text += emitted
-
-            if action is None:
-                break
-
-            tool = action.get("tool")
-            args = action.get("args") or {}
-            tool_name = re.sub(r"\s*\([^)]*\)\s*$", "", str(tool or "").strip())
-
-            # Cegah loop: aksi yang benar-benar sama tidak dijalankan 3x.
-            signature = f"{tool_name}|{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
-            if signature == last_signature:
-                repeat_count += 1
-            else:
-                last_signature = signature
-                repeat_count = 1
-            if repeat_count >= 3:
-                msg = (
-                    "Aksi yang sama sudah diulang tiga kali, jadi Nana hentikan. "
-                    "Coba beri perintah yang lebih spesifik atau satu langkah saja ya."
-                )
-                self._emit(msg)
-                emitted_any = True
-                final_text += msg
-                break
-
-            if not TOOLS_ENABLED:
-                msg = "Maaf, kontrol komputer sedang dimatikan (TOOLS_ENABLED=false)."
-                self._emit(msg)
-                emitted_any = True
-                final_text += msg
-                break
-
-            if step >= TOOLS_MAX_STEPS:
-                msg = "Maaf, langkahnya terlalu banyak. Coba satu per satu ya."
-                self._emit(msg)
-                emitted_any = True
-                final_text += msg
-                break
-
-            icon, label = runner.status(tool, args)
-            print(f"[tool] rencana: {tool} {json.dumps(args, ensure_ascii=False)[:200]}")
-            self._js(f"window.showAction({json.dumps(icon)}, {json.dumps(label)})")
-
-            if tool_name == "type_text" and self._terminal_guard:
-                result = {
-                    "ok": False,
-                    "blocked": True,
-                    "message": (
-                        "terminal sudah dibuka pada permintaan ini; "
-                        "gunakan run_command untuk perintah terminal"
-                    ),
-                }
-            else:
-                result = runner.run(tool, args)
-
-            if (
-                tool_name == "open_terminal"
-                and result.get("ok")
-                and "vscode" in str((args or {}).get("target") or "vscode").lower()
-            ):
-                self._terminal_guard = True
-
-            if self._current_task is not None:
-                if result.get("ok"):
-                    self._task_engine.complete_step(self._current_task.task_id, result)
-                else:
-                    self._task_engine.fail(self._current_task.task_id, result)
-
-            done_label = "Selesai"
-            if not result.get("ok"):
-                done_label = "Diblokir" if result.get("blocked") else "Gagal"
-            self._js(
-                f"window.finishAction({json.dumps(bool(result.get('ok')))}, "
-                f"{json.dumps(done_label)})"
-            )
-
-            remaining = max(0, TOOLS_MAX_STEPS - step - 1)
-            guidance = (
-                "Lanjutkan: kalau masih perlu aksi lain, balas JSON tool berikutnya. "
-                "Kalau sudah selesai, jawab user dengan bahasa Indonesia singkat. "
-                "Jangan tampilkan JSON ke user."
-            )
-            if not result.get("ok"):
-                guidance = (
-                    "Hasil ini GAGAL/BLOK. Jangan mengklaim berhasil. "
-                    "Pilih strategi lain yang aman (mis. browser_state/browser_tabs "
-                    "untuk melihat kondisi nyata) atau jelaskan kendalanya ke user. "
-                    "Jangan mengulang tool+args yang sama."
-                )
-            messages.append(
-                {"role": "assistant", "content": json.dumps(action, ensure_ascii=False)}
-            )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        f"[HASIL TOOL: {tool}] (sisa langkah: {remaining})\n"
-                        f"{json.dumps(result, ensure_ascii=False)}\n\n"
-                        f"{guidance}"
-                    ),
-                }
-            )
-
-        if not emitted_any:
-            msg = "Maaf, tidak ada respons dari AI. Coba lagi ya."
-            self._emit(msg)
-            final_text = msg
-            emitted_any = True
-
-        if self._current_task is not None and self._current_task.status not in ("failed", "cancelled"):
-            self._current_task.status = "completed" if emitted_any else "failed"
-
-        self._history.append({"role": "user", "content": message})
-        self._history.append({"role": "assistant", "content": final_text})
-        self._history = self._history[-10:]
-        return emitted_any
-
+# ------------------------------------------------------------------ main
 
 if __name__ == "__main__":
-    api = Api()
-    window = webview.create_window(
-        "Nana",
-        html=HTML,
-        js_api=api,
-        width=120,
-        height=100,
-        resizable=False,
-        frameless=True,
-        easy_drag=True,
-        on_top=True,
-        min_size=(SLEEP_WIN_W, SLEEP_WIN_H),
-    )
-    api.set_window(window)
-    try:
-        webview.start(lambda: api.start_auto())
-    finally:
-        api.stop_auto()
-        try:
-            browser.stop_browser()
-        except Exception as e:
-            print(f"[browser] cleanup dilewati: {type(e).__name__}: {e}")
-        try:
-            os.remove("temp.wav")
-        except OSError:
-            pass
+    app = MalvaApp()
+    app.run()
