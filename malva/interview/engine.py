@@ -175,7 +175,7 @@ class InterviewEngine:
                 self._qa_pairs.append({"question": "", "answer": text, "timestamp": evt.get("timestamp", 0)})
 
         if self._on_update:
-            self._on_update({"type": "notes_segment", "data": evt})
+            self._on_update({"type": "transcript_segment", "data": evt})
 
     def finalize_notes(self) -> dict:
         """Generate interview notes report."""

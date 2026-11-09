@@ -76,9 +76,10 @@ class MalvaSession:
             mode=mode,
             on_utterance=self._on_utterance,
             on_levels=self._on_audio_levels,
+            db=db,
         )
         self._transcript = TranscriptCore(session_id=self.session_id, db=db)
-        self._ai = AIOrchestrator(session_id=self.session_id, mode=mode, db=db)
+        self._ai = AIOrchestrator(session_id=self.session_id, mode=mode, db=db, privacy_manager=privacy)
 
         # Mode engines
         self._meeting:   MeetingEngine   | None = None
@@ -104,17 +105,23 @@ class MalvaSession:
 
     def start(self) -> None:
         """Start audio capture according to mode invariants."""
+        if self._running:
+            return
         self._running = True
         self.state    = SessionState.LISTENING
+        self._emit({"type": "state_change", "state": SessionState.LISTENING})
 
-        if self.mode in ("assistant", "interview_practice"):
+        if self.mode == "assistant":
             self._audio.start_microphone()
-        if self.mode == "meeting":
             self._audio.start_system_audio()
-        if self.mode == "interview_notes":
+        elif self.mode == "interview_practice":
+            self._audio.start_microphone()
+        elif self.mode == "meeting":
+            self._audio.start_system_audio()
+        elif self.mode == "interview_notes":
             self._audio.start_microphone()
             # system audio optional — not auto-started
-        if self.mode == "voice_input":
+        elif self.mode == "voice_input":
             self._audio.start_microphone()
             # system audio MUST NOT be started in voice_input (Blueprint §4)
 
@@ -212,48 +219,58 @@ class MalvaSession:
         """Called by AudioEngine when an utterance chunk is ready."""
         if not self._running:
             return
-        self.state = SessionState.PROCESSING
-        self._emit({"type": "state_change", "state": SessionState.PROCESSING})
+        
+        try:
+            self.state = SessionState.PROCESSING
+            self._emit({"type": "state_change", "state": SessionState.PROCESSING})
 
-        # Transcribe
-        self._asr.language = self._db.get_setting("asr_language", "auto")
-        result = self._asr.transcribe(wav_bytes)
-        if not result.full_text.strip():
+            # Transcribe
+            self._asr.language = self._db.get_setting("asr_language", "auto")
+            result = self._asr.transcribe(wav_bytes)
+            if not result.full_text.strip():
+                return
+
+            # Store in transcript core (never overwrites raw text)
+            track = self._audio.get_track(source)
+            track_id = track.track_id if track else ""
+            self._transcript.ingest(result, track_id=track_id, source_type=source.value)
+
+            # For voice input mode: just emit transcription, no AI call
+            if self.mode == "voice_input":
+                self._emit({"type": "voice_input_text", "text": result.full_text})
+                return
+
+            # For meeting / interview_notes: transcript already routed via listener
+            if self.mode in ("meeting", "interview_notes"):
+                return
+
+            # For assistant / interview_practice: send to AI
+            def on_chunk(chunk: str) -> None:
+                self._emit({"type": "ai_chunk", "text": chunk})
+
+            # Interview Practice mode: generate question or evaluate answer
+            if self.mode == "interview_practice" and self._interview:
+                # Check if we need first question
+                if not self._interview._practice.questions_asked:
+                    self._interview.get_next_question(on_chunk=on_chunk)
+                else:
+                    # Evaluate current answer and generate next question
+                    self._interview.evaluate_answer(result.full_text, on_chunk=on_chunk)
+                    self._interview.get_next_question(on_chunk=on_chunk)
+                return
+
+            full_text, action = self._ai.ask(result.full_text, on_chunk=on_chunk)
+
+            if action and self.mode == "assistant":
+                confirm_result = self._desktop.run(action["tool"], action.get("args", {}))
+                if confirm_result.get("ok"):
+                    follow = f"Tool executed: {confirm_result['result']}"
+                else:
+                    follow = f"Tool failed: {confirm_result['error']}"
+                self._ai.ask(follow, on_chunk=on_chunk)
+        finally:
             self.state = SessionState.LISTENING
-            return
-
-        # Store in transcript core (never overwrites raw text)
-        track = self._audio.get_track(source)
-        track_id = track.track_id if track else ""
-        self._transcript.ingest(result, track_id=track_id, source_type=source.value)
-
-        # For voice input mode: just emit transcription, no AI call
-        if self.mode == "voice_input":
-            self._emit({"type": "voice_input_text", "text": result.full_text})
-            self.state = SessionState.LISTENING
-            return
-
-        # For meeting / interview_notes: transcript already routed via listener
-        if self.mode in ("meeting", "interview_notes"):
-            self.state = SessionState.LISTENING
-            return
-
-        # For assistant / interview_practice: send to AI
-        def on_chunk(chunk: str) -> None:
-            self._emit({"type": "ai_chunk", "text": chunk})
-
-        full_text, action = self._ai.ask(result.full_text, on_chunk=on_chunk)
-
-        if action and self.mode == "assistant":
-            confirm_result = self._desktop.run(action["tool"], action.get("args", {}))
-            if confirm_result.get("ok"):
-                follow = f"Tool executed: {confirm_result['result']}"
-            else:
-                follow = f"Tool failed: {confirm_result['error']}"
-            self._ai.ask(follow, on_chunk=on_chunk)
-
-        self.state = SessionState.LISTENING
-        self._emit({"type": "state_change", "state": SessionState.LISTENING})
+            self._emit({"type": "state_change", "state": SessionState.LISTENING})
 
     def _on_audio_levels(self, levels: list[float]) -> None:
         self._emit({"type": "audio_levels", "levels": levels})

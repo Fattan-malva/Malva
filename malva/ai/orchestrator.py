@@ -89,10 +89,11 @@ def get_system_prompt(mode: str, extra_context: str = "") -> str:
 # ------------------------------------------------------------------ orchestrator
 
 class AIOrchestrator:
-    def __init__(self, session_id: str, mode: str, db: Database):
+    def __init__(self, session_id: str, mode: str, db: Database, privacy_manager = None):
         self.session_id = session_id
         self.mode       = mode
         self._db        = db
+        self._privacy   = privacy_manager
         self._history: list[dict] = []
         self._running   = True
         self._headers   = {"Content-Type": "application/json"}
@@ -209,6 +210,16 @@ class AIOrchestrator:
         on_chunk: Callable[[str], None] | None,
     ) -> tuple[str, dict | None]:
         """Stream LLM response. Returns (emitted_text, action_or_None)."""
+        # Only block if local_only AND endpoint is actually remote (not localhost)
+        if self._privacy and self._privacy.local_only:
+            is_remote = "ollama.com" in OLLAMA_URL.lower() or (
+                "localhost" not in OLLAMA_URL.lower() and 
+                "127.0.0.1" not in OLLAMA_URL.lower()
+            )
+            if is_remote:
+                print("[ai] local_only enforced: cloud LLM blocked")
+                return "", None
+
         emitted:  list[str] = []
         buffered  = ""
         mode_     = None   # "text" | "action"
@@ -305,6 +316,15 @@ class AIOrchestrator:
         messages: list[dict],
         on_chunk: Callable[[str], None] | None,
     ) -> tuple[str, dict | None]:
+        # Only block if local_only AND endpoint is actually remote
+        if self._privacy and self._privacy.local_only:
+            is_remote = "ollama.com" in OLLAMA_URL.lower() or (
+                "localhost" not in OLLAMA_URL.lower() and 
+                "127.0.0.1" not in OLLAMA_URL.lower()
+            )
+            if is_remote:
+                print("[ai] local_only enforced: cloud LLM fallback blocked")
+                return "", None
         try:
             with httpx.Client(timeout=120.0) as client:
                 resp = client.post(

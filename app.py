@@ -158,10 +158,11 @@ class MalvaAPI:
                 user32 = ctypes.windll.user32
                 hwnd = self._app.get_hwnd()
                 if hwnd:
-                    user32.ReleaseCapture()
-                    user32.SendMessageW(hwnd, 0x0112, 0xF012, 0)
-            except Exception:
-                pass
+                    # For always-on-top windows, use PostMessage approach
+                    user32.PostMessageW(hwnd, 0x0112, 0xF012, 0)  # WM_SYSCOMMAND + SC_MOVE
+                    user32.PostMessageW(hwnd, 0x0201, 1, 0)  # WM_LBUTTONDOWN to trigger move
+            except Exception as e:
+                print(f"[drag] {e}")
 
     def update_action_status(self, item_id: str, status: str) -> None:
         self._app.database.update_action_item_status(item_id, status)
@@ -196,6 +197,7 @@ class MalvaApp:
             compute_type="int8",
             language=saved_lang,
             auto_load=True,
+            privacy_manager=self.privacy,
         )
         self.asr_router.set_status_callback(self._on_asr_status_update)
 
@@ -335,6 +337,10 @@ class MalvaApp:
             if self.session.focus_mode:
                 # Focus Mode suppresses sleep (Blueprint §7)
                 continue
+            # Don't sleep if session is actively listening, processing, or focused
+            if self.session.state in (SessionState.LISTENING, SessionState.PROCESSING, SessionState.FOCUSED):
+                self._last_active_time = time.time()
+                continue
             if not self._is_sleeping:
                 idle = time.time() - self._last_active_time
                 if idle >= SLEEP_AFTER_SECONDS:
@@ -387,8 +393,8 @@ class MalvaApp:
 
         self.js(f"window.updateMode('{self.current_mode}')")
         self.sync_asr_status()
-        self.sync_sources()
         self.session.start()
+        self.sync_sources()
 
         # Start idle monitor thread
         self._idle_thread = threading.Thread(target=self._idle_monitor, daemon=True)

@@ -121,6 +121,32 @@ html, body {
   align-items: center;
   gap: 5px;
   flex-shrink: 0;
+  transition: background 0.15s, border-color 0.15s;
+}
+.mode-chip:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+}
+
+.mode-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.mode-option:hover {
+  background: var(--bg-hover);
+}
+.mode-option svg {
+  width: 16px;
+  height: 16px;
+  stroke: var(--text-secondary);
+  flex-shrink: 0;
 }
 
 /* State Dot */
@@ -565,11 +591,36 @@ html, body {
       <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M5 9h14M5 15h14"/></svg>
     </div>
 
-    <!-- Mode Chip -->
-    <span id="modeChip" class="mode-chip">
+    <!-- Mode Chip (clickable dropdown) -->
+    <span id="modeChip" class="mode-chip" onclick="window._toggleModeDropdown()" style="cursor:pointer;position:relative" title="Klik untuk ubah mode">
       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="m4.93 4.93 4.24 4.24"/><path d="m14.83 9.17 4.24-4.24"/><path d="m14.83 14.83 4.24 4.24"/><path d="m9.17 14.83-4.24 4.24"/></svg>
       <span id="modeText">Asisten</span>
+      <svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
     </span>
+    
+    <!-- Mode Dropdown -->
+    <div id="modeDropdown" style="display:none;position:absolute;top:50px;left:42px;z-index:9999;background:var(--bg-elevated);border:1px solid var(--border-strong);border-radius:8px;min-width:200px;box-shadow:0 8px 24px rgba(0,0,0,0.6);overflow:hidden">
+      <div class="mode-option" onclick="window._selectMode('assistant')" data-mode="assistant">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="m4.93 4.93 4.24 4.24"/></svg>
+        <span>Asisten Umum</span>
+      </div>
+      <div class="mode-option" onclick="window._selectMode('meeting')" data-mode="meeting">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/></svg>
+        <span>Meeting Intelligence</span>
+      </div>
+      <div class="mode-option" onclick="window._selectMode('interview_practice')" data-mode="interview_practice">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <span>Latihan Wawancara</span>
+      </div>
+      <div class="mode-option" onclick="window._selectMode('interview_notes')" data-mode="interview_notes">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        <span>Catatan Wawancara</span>
+      </div>
+      <div class="mode-option" onclick="window._selectMode('voice_input')" data-mode="voice_input">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/></svg>
+        <span>Input Suara Saja</span>
+      </div>
+    </div>
 
     <!-- State Indicator Dot -->
     <div id="stateDot" class="state-dot" title="Status Sistem"></div>
@@ -827,14 +878,39 @@ window._showTab = function(tabName) {
 // ==========================================================================
 // PYTHON STATE HANDLERS
 // ==========================================================================
+// WebAudio cues: no external files, works after first user gesture.
+let _audioCtx = null, _soundUnlocked = false, _wasListening = false;
+function _audio() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!_audioCtx && Ctx) _audioCtx = new Ctx();
+    if (_audioCtx && _audioCtx.state === 'suspended') _audioCtx.resume();
+    return _audioCtx;
+  } catch (_) { return null; }
+}
+function _tone(freq, end, delay, duration, gain, type = 'sine') {
+  const c = _audio(); if (!c) return;
+  const t = c.currentTime + delay, o = c.createOscillator(), g = c.createGain();
+  o.type = type; o.frequency.setValueAtTime(freq, t);
+  if (end) o.frequency.exponentialRampToValueAtTime(end, t + duration);
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(gain, t + 0.03);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+  o.connect(g); g.connect(c.destination); o.start(t); o.stop(t + duration + 0.05);
+}
+function _spawnFx() { _tone(260, 1400, 0, .42, .10, 'sine'); _tone(390, 2100, 0, .42, .04, 'triangle'); }
+function _completeFx() { _tone(1047, 0, 0, .22, .12); _tone(1568, 0, .12, .32, .14); }
+document.addEventListener('pointerdown', () => { _soundUnlocked = true; _audio(); }, true);
 window.updateState = function(state) {
   S.state = state;
   stateDot.className = 'state-dot ' + state;
   spectrum.classList.toggle('listening', state === 'listening');
   spinnerRow.classList.toggle('show', state === 'processing');
+  if (state === 'listening' && !_wasListening) _spawnFx();
+  _wasListening = state === 'listening';
 };
 
 window.updateMode = function(mode) {
+  S.mode = mode;
   const labels = {
     assistant: 'Asisten',
     meeting: 'Meeting',
@@ -843,6 +919,15 @@ window.updateMode = function(mode) {
     voice_input: 'Input Suara'
   };
   modeText.textContent = labels[mode] || mode;
+  
+  // Update dropdown active state
+  const dropdown = document.getElementById('modeDropdown');
+  if (dropdown) {
+    dropdown.querySelectorAll('.mode-option').forEach(opt => {
+      opt.style.background = opt.dataset.mode === mode ? 'var(--bg-hover)' : '';
+    });
+  }
+  
   document.getElementById('modeSelect').value = mode;
 };
 
@@ -961,6 +1046,7 @@ window.appendAnswer = function(chunk) {
 
 window.endAnswer = function() {
   answerArea.innerHTML = (typeof marked !== 'undefined') ? marked.parse(S.answerRaw) : S.answerRaw.replace(/\n/g, '<br>');
+  _completeFx();
   document.getElementById('tabContent').scrollTop = 99999;
 };
 
@@ -1070,14 +1156,39 @@ window.setSleeping = function(isSleeping) {
 };
 
 // Drag
-document.getElementById('dragGrip').addEventListener('mousedown', () => {
+document.getElementById('dragGrip').addEventListener('mousedown', (e) => {
+  e.preventDefault();
   if (window.pywebview && window.pywebview.api) {
-    window.pywebview.api.start_drag().catch(() => {});
+    window.pywebview.api.start_drag();
   }
 });
 
-// Init
-window.addEventListener('load', () => {
+// Mode Dropdown
+window._toggleModeDropdown = function(e) {
+  const dropdown = document.getElementById('modeDropdown');
+  const isVisible = dropdown.style.display !== 'none';
+  dropdown.style.display = isVisible ? 'none' : 'block';
+  if (!isVisible) {
+    // Close on outside click
+    setTimeout(() => {
+      document.addEventListener('click', function closeDropdown(evt) {
+        if (!dropdown.contains(evt.target) && evt.target.id !== 'modeChip') {
+          dropdown.style.display = 'none';
+          document.removeEventListener('click', closeDropdown);
+        }
+      });
+    }, 100);
+  }
+};
+
+window._selectMode = function(mode) {
+  document.getElementById('modeDropdown').style.display = 'none';
+  if (window.pywebview && window.pywebview.api) {
+    window.pywebview.api.change_mode(mode);
+  }
+};
+
+  
   if (window.pywebview && window.pywebview.api) {
     window.pywebview.api.ui_ready();
   }

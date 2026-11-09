@@ -39,8 +39,8 @@ CHANNELS    = 1
 TARGET_RATE = 16000
 
 # VAD parameters (calibrated for laptop microphones)
-SPEECH_THRESHOLD   = 65.0    # RMS trigger threshold
-SILENCE_THRESHOLD  = 35.0    # RMS silence threshold
+SPEECH_THRESHOLD   = 45.0    # RMS trigger threshold (lowered from 65 for better sensitivity)
+SILENCE_THRESHOLD  = 25.0    # RMS silence threshold (lowered from 35)
 SILENCE_DURATION   = 1.1     # Seconds of silence to finalize utterance
 MAX_RECORD_SECONDS = 30.0
 PRE_BUFFER_CHUNKS  = 12      # ~0.4s pre-speech audio buffer
@@ -172,19 +172,41 @@ class AudioTrack:
                 arr = np.frombuffer(data, dtype=np.int16).astype(np.float32)
                 rms = float(np.sqrt(np.mean(arr ** 2))) if arr.size else 0.0
                 chunk_idx += 1
+                
+                # Debug: print RMS every 50 chunks to monitor audio levels
+                if chunk_idx % 50 == 0:
+                    print(f"[audio/{self.source.value}] RMS: {rms:.1f}")
 
-                # Send 5-bar spectrum levels to UI
-                if self._on_levels and self.source == TrackSource.MICROPHONE:
-                    seg = max(1, len(arr) // 5)
-                    levels = []
-                    for i in range(5):
-                        ch = arr[i * seg:(i + 1) * seg]
-                        if len(ch) == 0:
-                            levels.append(6.0)
-                            continue
-                        r = float(np.sqrt(np.mean(ch ** 2)))
-                        lvl = min(32.0, 6.0 + np.sqrt(r) * 2.2)
-                        levels.append(round(lvl, 1))
+                # Send 5-bar spectrum levels to UI (both mic and system audio)
+                if self._on_levels:
+                    if len(arr) >= 64:
+                        # FFT-based frequency bands (5 bands: sub, low, mid, high, ultra)
+                        fft = np.fft.rfft(arr * np.hanning(len(arr)))
+                        magnitudes = np.abs(fft)
+                        band_size = len(magnitudes) // 5
+                        levels = []
+                        for i in range(5):
+                            start = i * band_size
+                            end = (i + 1) * band_size if i < 4 else len(magnitudes)
+                            band = magnitudes[start:end]
+                            if len(band) == 0:
+                                levels.append(6.0)
+                                continue
+                            avg = float(np.mean(band))
+                            lvl = min(32.0, 6.0 + np.sqrt(avg) * 2.2)
+                            levels.append(round(lvl, 1))
+                    else:
+                        # Fallback to RMS slices
+                        seg = max(1, len(arr) // 5)
+                        levels = []
+                        for i in range(5):
+                            ch = arr[i * seg:(i + 1) * seg]
+                            if len(ch) == 0:
+                                levels.append(6.0)
+                                continue
+                            r = float(np.sqrt(np.mean(ch ** 2)))
+                            lvl = min(32.0, 6.0 + np.sqrt(r) * 2.2)
+                            levels.append(round(lvl, 1))
                     self._on_levels(levels)
 
                 # VAD State Machine
@@ -202,6 +224,7 @@ class AudioTrack:
                             record_start = time.time()
                             above_count = 0
                             silence_count = 0
+                            print(f"[audio/{self.source.value}] Speech detected! RMS: {rms:.1f}")
                     else:
                         above_count = 0
                 else:
@@ -212,6 +235,7 @@ class AudioTrack:
                         silence_count += 1
                         if silence_count >= silence_needed or elapsed >= MAX_RECORD_SECONDS:
                             if len(frames) >= min_frames:
+                                print(f"[audio/{self.source.value}] Utterance complete: {elapsed:.1f}s, {len(frames)} frames")
                                 wav_bytes = self._frames_to_wav(frames, actual_rate)
                                 threading.Thread(
                                     target=self._on_utterance,
@@ -254,25 +278,49 @@ class AudioTrack:
         return None  # Default input for microphone
 
     def _find_system_audio_device(self) -> int | None:
-        """Find Stereo Mix / WASAPI loopback device."""
-        pa_local = pyaudio.PyAudio()
+        """Find WASAPI loopback device via pyaudiowpatch."""
+        if not _HAS_WPATCH:
+            print(f"[audio/{self.source.value}] pyaudiowpatch not available")
+            return None
+            
         try:
-            count = pa_local.get_device_count()
-            for i in range(count):
-                info = pa_local.get_device_info_by_index(i)
-                name: str = info.get("name", "").lower()
-                if info.get("maxInputChannels", 0) > 0 and "stereo mix" in name:
-                    self.device_name = info.get("name", "Stereo Mix")
-                    return i
-            for i in range(count):
-                info = pa_local.get_device_info_by_index(i)
-                name = info.get("name", "").lower()
-                if info.get("maxInputChannels", 0) > 0 and "loopback" in name:
-                    self.device_name = info.get("name", "Loopback")
-                    return i
-        finally:
-            pa_local.terminate()
-        return None
+            import pyaudiowpatch as pa_wp
+            pa_local = pa_wp.PyAudio()
+            try:
+                # Get default output device for loopback
+                default_output = pa_local.get_default_output_device_info()
+                loopback_info = pa_local.get_loopback_device_info(default_output["index"])
+                self.device_name = loopback_info["name"]
+                device_idx = loopback_info["index"]
+                pa_local.terminate()
+                print(f"[audio/{self.source.value}] Found WASAPI loopback: {self.device_name} (device {device_idx})")
+                return device_idx
+            except Exception as e:
+                print(f"[audio/{self.source.value}] get_loopback_device_info failed: {e}")
+                pa_local.terminate()
+                
+                # Fallback to legacy name search
+                pa_legacy = pyaudio.PyAudio()
+                count = pa_legacy.get_device_count()
+                print(f"[audio/{self.source.value}] Searching {count} devices for Stereo Mix/Loopback...")
+                for i in range(count):
+                    try:
+                        info = pa_legacy.get_device_info_by_index(i)
+                        name: str = info.get("name", "").lower()
+                        max_in = info.get("maxInputChannels", 0)
+                        if max_in > 0 and ("stereo mix" in name or "loopback" in name):
+                            self.device_name = info.get("name", "Stereo Mix")
+                            pa_legacy.terminate()
+                            print(f"[audio/{self.source.value}] Found via name search: {self.device_name} (device {i})")
+                            return i
+                    except Exception:
+                        continue
+                pa_legacy.terminate()
+                print(f"[audio/{self.source.value}] No system audio device found")
+                return None
+        except Exception as e:
+            print(f"[audio/{self.source.value}] System audio detection error: {e}")
+            return None
 
     def _frames_to_wav(self, frames: list[bytes], sample_rate: int) -> bytes:
         """Convert raw PCM frames to WAV bytes (resampled to 16 kHz if necessary)."""
@@ -308,18 +356,19 @@ class AudioEngine:
         mode: str,
         on_utterance: Callable[[bytes, TrackSource, str], None],
         on_levels: Callable[[list[float]], None] | None = None,
+        db = None,
     ):
         self.session_id    = session_id
         self.mode          = mode
         self._on_utterance = on_utterance
         self._on_levels    = on_levels
+        self._db           = db
         self._tracks: dict[TrackSource, AudioTrack] = {}
 
     def set_levels_callback(self, fn: Callable[[list[float]], None] | None) -> None:
         self._on_levels = fn
         for track in self._tracks.values():
-            if track.source == TrackSource.MICROPHONE:
-                track._on_levels = fn
+            track._on_levels = fn
 
     def start_microphone(self, device_index: int | None = None) -> AudioTrack:
         return self._start_track(TrackSource.MICROPHONE, device_index)
@@ -365,9 +414,22 @@ class AudioEngine:
             source=source,
             session_id=self.session_id,
             on_utterance=on_track_utterance,
-            on_levels=self._on_levels if source == TrackSource.MICROPHONE else None,
+            on_levels=self._on_levels,
             device_index=device_index,
         )
+        # Register before capture starts; an utterance can finish on another thread.
+        if self._db:
+            try:
+                self._db.create_audio_track(
+                    track_id=track.track_id,
+                    session_id=self.session_id,
+                    source_type=source.value,
+                    device_name=track.device_name or "Unknown",
+                    sample_rate=16000,
+                    channels=1,
+                )
+            except Exception as e:
+                print(f"[audio] Failed to register track: {e}")
         self._tracks[source] = track
         track.start()
         return track

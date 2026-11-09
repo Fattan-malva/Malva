@@ -43,7 +43,15 @@ class PrivacyManager:
         self.hidden_mode_status = HiddenModeStatus.DISABLED
         self._hwnd: int | None  = None
         self.cloud_processing   = False   # opt-in only
-        self.local_only         = True
+        
+        # Auto-detect local_only based on OLLAMA_URL
+        # If OLLAMA_URL points to localhost/127.0.0.1, allow it even with local_only
+        # If explicitly set to cloud endpoint, assume user wants cloud processing
+        import os
+        ollama_url = os.getenv("OLLAMA_URL", "")
+        is_local_ollama = any(h in ollama_url.lower() for h in ("localhost", "127.0.0.1", "::1"))
+        # Default to local_only UNLESS user explicitly configured cloud Ollama
+        self.local_only = not ollama_url or is_local_ollama
 
     # ------------------------------------------------------------------ Hidden Mode
 

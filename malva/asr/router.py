@@ -108,11 +108,13 @@ class ASRRouter:
         compute_type: str = "int8",
         language: str = "auto",
         auto_load: bool = True,
+        privacy_manager = None,
     ):
         self.model_size    = model_size
         self.device        = device
         self.compute_type  = compute_type
         self.language      = language   # "auto" or BCP-47
+        self._privacy      = privacy_manager
         self._model        = None
         self._model_name   = ""
         self._load_error   = ""
@@ -246,7 +248,11 @@ class ASRRouter:
         if local_model is not None:
             result = self._transcribe_local(local_model, wav_bytes)
         else:
-            result = self._transcribe_cloud(wav_bytes)
+            if self._privacy and self._privacy.local_only:
+                print("[asr] local_only enforced: no local model, cloud blocked")
+                result = ASRResult(full_text="", language="und", model_used="none-available")
+            else:
+                result = self._transcribe_cloud(wav_bytes)
 
         result.duration_ms = (time.time() - t0) * 1000
         return result
@@ -286,6 +292,9 @@ class ASRRouter:
             )
         except Exception as e:
             print(f"[asr/local] error: {e}")
+            if self._privacy and self._privacy.local_only:
+                print("[asr] local_only enforced: cloud fallback blocked")
+                return ASRResult(full_text="", language="und", model_used="local-failed")
             return self._transcribe_cloud(wav_bytes)
 
     def _transcribe_cloud(self, wav_bytes: bytes) -> ASRResult:

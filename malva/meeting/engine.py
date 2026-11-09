@@ -36,7 +36,7 @@ class MeetingEngine:
     def on_segment(self, evt: dict) -> None:
         """Called by TranscriptCore on each new segment."""
         if self._on_update:
-            self._on_update({"type": "segment", "data": evt})
+            self._on_update({"type": "transcript_segment", "data": evt})
 
     # ------------------------------------------------------------------ end-of-session analysis
 
