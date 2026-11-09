@@ -110,3 +110,6 @@ Daftar QA manual lengkap ada di `Malva_Repository_Audit_and_Agent_Prompt_v2.md`.
 - **Drag window**: sebelumnya `PostMessage(SC_MOVE)` dan tidak pernah menggerakkan window. Sekarang memakai mekanisme drag pywebview 6.2.1: `easy_drag=False` dan statusbar bertanda `pywebview-drag-region`. Belum diuji di Windows.
 - **Teks live**: transkripsi sebelumnya baru jalan setelah 1,1 detik hening (atau 30 detik). Sekarang snapshot ucapan dikirim tiap ~1 detik ke Whisper lokal, dan hasilnya muncul sebagai `transcript_partial` di Chat dan Transkrip. Hasil final menggantikannya. Teks live hanya tampil saat panel terbuka; saat pill mengecil belum tampil.
 - **Tanpa LLM lokal**: lihat §3.
+- **Teks live lebih ringan**: partial hanya men-decode 8 detik terakhir (`PARTIAL_WINDOW_SECONDS`), bukan seluruh utterance tiap detik.
+- **Bahasa default Indonesia** (`DEFAULT_ASR_LANGUAGE = "id"`): deteksi otomatis pada potongan pendek sering salah bahasa. Ubah lewat Setelan.
+- **Opsi ASR yang dipertimbangkan (belum diimplementasi)**: lihat catatan di chat. Azure Speech (`id-ID`, real-time, 5 jam/bulan gratis) dan Vosk (streaming ringan, model Indonesia belum diverifikasi).

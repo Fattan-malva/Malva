@@ -50,7 +50,7 @@ from malva.audio.capture import TrackSource
 from malva.desktop.gateway import DesktopGateway
 from malva.privacy.manager import PrivacyManager
 from malva.shell.policy import parse_sleep_seconds, protected_capture_warning, should_auto_sleep
-from malva.shell.session import MODES, MalvaSession, SessionState
+from malva.shell.session import DEFAULT_ASR_LANGUAGE, MODES, MalvaSession, SessionState
 from malva.storage import db
 from malva.ui.html import PILL_HTML
 
@@ -195,7 +195,7 @@ class MalvaApp:
         tools_enabled = os.getenv("TOOLS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
         self.desktop = DesktopGateway(session_id="", db=self.database, tools_enabled=tools_enabled)
 
-        saved_lang = self.database.get_setting("asr_language", "auto")
+        saved_lang = self.database.get_setting("asr_language", DEFAULT_ASR_LANGUAGE)
         self.asr_router = ASRRouter(
             model_size="small",
             device="cpu",

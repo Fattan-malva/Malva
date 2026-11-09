@@ -168,3 +168,18 @@ def test_levels_are_tagged_with_source(fake_mic_only):
     src, levels = seen[0]
     assert src == TrackSource.MICROPHONE
     assert len(levels) == 5 and all(0.0 <= v <= 1.0 for v in levels)
+
+
+def test_live_text_decodes_only_the_recent_window():
+    """Partial passes must not re-decode the whole utterance: cost would grow with every second."""
+    from malva.audio import capture as cap
+    from malva.audio.capture import AudioTrack, TrackSource
+
+    seen = []
+    track = AudioTrack(TrackSource.MICROPHONE, "s1", on_utterance=lambda *a: None,
+                       on_partial=lambda wav, t: seen.append(wav))
+    frames = [b"\x00\x00" * cap.CHUNK] * 400  # about 25 s of speech
+    track._emit_partial(frames)
+    window = int(cap.PARTIAL_WINDOW_SECONDS * track.sample_rate / cap.CHUNK)
+    expected = AudioTrack._frames_to_wav(frames[-window:], track.sample_rate)
+    assert len(seen) == 1 and len(seen[0]) == len(expected)

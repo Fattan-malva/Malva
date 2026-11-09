@@ -68,6 +68,9 @@ MAX_CONSECUTIVE_READ_ERRORS = 25
 # every PARTIAL_INTERVAL_SECONDS once PARTIAL_MIN_SECONDS of speech exists.
 PARTIAL_INTERVAL_SECONDS = 1.0
 PARTIAL_MIN_SECONDS      = 0.8
+# Live text decodes only the last few seconds. Decoding the whole utterance every second
+# costs more with each second of speech.
+PARTIAL_WINDOW_SECONDS  = 8.0
 
 
 class TrackSource(str, Enum):
@@ -316,7 +319,8 @@ class AudioTrack:
     def _emit_partial(self, frames: list[bytes]) -> None:
         """Hand a snapshot of the speech so far to the session. Never raises into the capture loop."""
         try:
-            wav = self._frames_to_wav(list(frames), self.sample_rate)
+            window = max(1, int(PARTIAL_WINDOW_SECONDS * self.sample_rate / CHUNK))
+            wav = self._frames_to_wav(list(frames[-window:]), self.sample_rate)
             self._on_partial(wav, self)
         except Exception as e:
             print(f"[audio] partial hand-off failed: {e}")

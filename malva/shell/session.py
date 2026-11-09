@@ -39,6 +39,9 @@ from malva.storage.db import Database
 from malva.transcript.core import TranscriptCore
 
 
+# Indonesian by default: auto-detection on short chunks often picks the wrong language.
+DEFAULT_ASR_LANGUAGE = "id"
+
 MODES = ("assistant", "meeting", "interview_practice", "interview_notes", "voice_input")
 
 # Sources each mode starts by default (Blueprint §4).
@@ -416,7 +419,7 @@ class MalvaSession:
         self._set_state(SessionState.PROCESSING)
         try:
             self.touch()
-            self._asr.language = self._db.get_setting("asr_language", "auto")
+            self._asr.language = self._db.get_setting("asr_language", DEFAULT_ASR_LANGUAGE)
             result = self._asr.transcribe(wav_bytes)
 
             if result.model_used in (LOCAL_MODEL_REQUIRED, LOCAL_FAILED):
@@ -482,7 +485,7 @@ class MalvaSession:
 
     def _run_partial(self, wav_bytes: bytes, source: TrackSource) -> None:
         try:
-            self._asr.language = self._db.get_setting("asr_language", "auto")
+            self._asr.language = self._db.get_setting("asr_language", DEFAULT_ASR_LANGUAGE)
             result = self._asr.transcribe(wav_bytes)
             text = (result.full_text or "").strip()
             if not text or result.model_used in (LOCAL_MODEL_REQUIRED, LOCAL_FAILED):
