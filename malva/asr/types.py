@@ -12,7 +12,8 @@ from dataclasses import dataclass, field
 # Reasons a transcription could not start. The session shows them to the user.
 ASR_NOT_CONFIGURED = "asr-not-configured"   # GEMINI_API_KEY is empty
 ASR_CLOUD_DISABLED = "asr-cloud-disabled"   # CLOUD_ENABLED=false
-ASR_FAILED         = "asr-failed"           # connection or API error
+ASR_FAILED         = "asr-failed"           # connection or API error (retried)
+ASR_REJECTED       = "asr-rejected"         # server refused the request (not retried)
 
 
 @dataclass

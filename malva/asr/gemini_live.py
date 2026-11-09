@@ -21,11 +21,12 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import re
 import threading
 import time
 from typing import Any, Callable
 
-from malva.asr.types import ASR_FAILED
+from malva.asr.types import ASR_FAILED, ASR_REJECTED
 
 MODEL_DEFAULT             = "gemini-3.5-transcribe-live"
 INPUT_RATE                = 16000
@@ -48,6 +49,30 @@ def language_codes_for(setting: str) -> list[str]:
     if "-" in raw:
         return [raw]              # already BCP-47, for example "ja-JP"
     return []
+
+
+_REJECT_RE = re.compile(r"HTTP (400|401|403|404)\b")
+
+
+def rejection_status(error: BaseException) -> str | None:
+    """HTTP status when the server refused the request for good (wrong model or key), else None.
+
+    Retrying these never helps, so the stream stops and says why.
+    """
+    code = getattr(error, "code", None) or getattr(error, "status_code", None)
+    if isinstance(code, int) and code in (400, 401, 403, 404):
+        return str(code)
+    match = _REJECT_RE.search(str(error))
+    return match.group(1) if match else None
+
+
+def rejection_message(status: str, model: str) -> str:
+    if status == "404":
+        return (f"Model transkripsi '{model}' tidak ditemukan untuk key ini (HTTP 404). "
+                "Periksa GEMINI_ASR_MODEL di .env.")
+    if status in ("401", "403"):
+        return f"Key Gemini ditolak (HTTP {status}). Periksa GEMINI_API_KEY di .env."
+    return f"Permintaan transkripsi ditolak (HTTP {status}). Periksa GEMINI_API_KEY dan GEMINI_ASR_MODEL."
 
 
 def _text_of(obj: Any) -> str:
@@ -136,6 +161,10 @@ class GeminiLiveStream:
                     await self._pump(session)
             except Exception as e:
                 if self._closing.is_set():
+                    break
+                status = rejection_status(e)
+                if status is not None:
+                    self._safe(lambda m: self._on_error(ASR_REJECTED, m), rejection_message(status, self._model))
                     break
                 failures += 1
                 self._report_error(f"Koneksi transkripsi cloud gagal ({failures}/{MAX_CONSECUTIVE_FAILURES}): {e}")

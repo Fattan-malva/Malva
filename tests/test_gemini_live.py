@@ -10,7 +10,9 @@ import threading
 import time
 from types import SimpleNamespace
 
-from malva.asr.gemini_live import GeminiLiveStream, language_codes_for
+import pytest
+
+from malva.asr.gemini_live import GeminiLiveStream, language_codes_for, rejection_status
 
 
 class FakeTypes:
@@ -163,3 +165,34 @@ def test_connection_failure_is_reported_not_raised():
 def test_language_codes_mapping_for_settings():
     assert language_codes_for("id") == ["id-ID"]
     assert language_codes_for("auto") == []
+
+
+def test_rejected_model_is_reported_once_and_not_retried():
+    errors, attempts = [], []
+
+    def refused():
+        attempts.append(1)
+        raise RuntimeError("server rejected WebSocket connection: HTTP 404")
+
+    stream = GeminiLiveStream(
+        "microphone", api_key="k", model="gemini-3.5-transcribe-live", language_codes=[],
+        on_partial=lambda t: None, on_final=lambda t: None,
+        on_error=lambda code, msg: errors.append((code, msg)),
+        client_factory=refused, types_module=FakeTypes,
+    )
+    stream.start()
+    assert _wait(lambda: errors)
+    time.sleep(0.3)
+    assert len(attempts) == 1, "a 404 must not be retried"
+    assert errors[0][0] == "asr-rejected"
+    assert "gemini-3.5-transcribe-live" in errors[0][1] and "GEMINI_ASR_MODEL" in errors[0][1]
+
+
+@pytest.mark.parametrize("message, status", [
+    ("server rejected WebSocket connection: HTTP 404", "404"),
+    ("HTTP 401 Unauthorized", "401"),
+    ("server rejected WebSocket connection: HTTP 503", None),
+    ("tidak ada jaringan", None),
+])
+def test_only_permanent_rejections_are_classified(message, status):
+    assert rejection_status(RuntimeError(message)) == status
