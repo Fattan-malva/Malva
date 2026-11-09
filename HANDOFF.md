@@ -1,73 +1,98 @@
-# HANDOFF.md — Malva Project
-> **Update otomatis setiap sesi kerja. Baca file ini sebelum melanjutkan.**
-> Last updated: 2026-11-09 · Phase: 1–3 SELESAI + CRITICAL BUGFIXES (Audio Spectrum & Solid Black Native Window)
+# HANDOFF.md — Malva
+
+> Terakhir diperbarui: 2026-11-09.
+> Blueprint produk: **`BLUEPRINT.md`** (bukan `Blueprint.md`).
+> Status singkat: perbaikan kode dan test selesai di Linux (87 test lolos). **Belum pernah dijalankan di Windows.** Push belum berhasil (lihat §9).
 
 ---
 
-## 1. Tujuan & Arsitektur
+## 1. Ringkasan status
 
-**Malva** adalah rebrand dan evolusi dari **Nana** — private AI desktop copilot untuk Windows.
-Tagline: *"Your computer, understood."*
-Referensi blueprint lengkap: [`Blueprint.md`](./Blueprint.md)
+- Audit P0 (audio, privasi, sleep/focus, event, UI) diperbaiki di kode dan dicakup test.
+- UI (`malva/ui/html.py`) ditulis ulang. Sebelumnya ada kesalahan sintaks JavaScript (`});` tidak berpasangan) yang tidak tertangkap audit. Sekarang skrip inline lolos `node --check`, dan test kontrak memastikan setiap fungsi yang dipanggil Python ada di halaman.
+- Yang belum selesai dari blueprint: integrasi Windows-MCP (P2), Qwen3-ASR, VAD untuk wawancara, memori lintas meeting, keputusan-ke-eksekusi, screen-aware, dan jembatan multibahasa (lihat §7).
 
-### Standar Kualitas Desain (Hallmark & Impeccable Standards)
-- **Zero White Edges & Native DWM Rounded Window**: Window menggunakan `background_color="#000000"`, `transparent=False`, serta Win32 API `DwmSetWindowAttribute` (`DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2`) sehingga Windows 11 membulatkan sudut jendela secara native hardware tanpa sisa kotak putih di ujung-ujung.
-- **Solid Pure Black (#000000), Tanpa Glass**: Seluruh efek translucent blur/glass dihilangkan. Warna murni hitam pekat solid `#000000` dengan border tipis `#222226`.
-- **Zero Purple Color**: Seluruh warna ungu/indigo/violet telah diganti menjadi palet monokromatik netral (putih `#f8fafc`, slate `#a1a1aa`, zinc `#3f3f46`) dengan aksen fungsional hijau `#22c55e` (listening), merah `#ef4444` (mic/speech), dan kuning `#f59e0b` (processing).
-- **5-Bar Responsive Live Spectrum**: 5-bar equalizer visualizer telah dipulihkan dan dikendalikan langsung oleh nilai RMS audio nyata dari mikrofon via `pyaudio` chunk per chunk (`window.updateBars(levels)`).
-- **Audio Capture & VAD Stabil**: Dukungan multi-sample-rate fallback (`16000`, `44100`, `48000` Hz) untuk mencegah kegagalan mic rate Windows, dilengkapi pre-speech buffer (`PRE_BUFFER_CHUNKS = 12`) dan VAD threshold terkalibrasi (`SPEECH_THRESHOLD = 65.0`, `SILENCE_THRESHOLD = 35.0`).
-- **In-Settings Model Manager**: Pemuatan Whisper berjalan asynchronous di background tanpa membekukan UI saat startup.
+## 2. Mode dan sumber audio (BLUEPRINT §4)
 
-### Struktur Proyek (100% Modular & Clean)
-```
-Nana/
-├── .env                 (Konfigurasi runtime lokal)
-├── .env.example         (Contoh konfigurasi)
-├── .gitignore           (Git ignore file)
-├── app.py               (Entry point utama Malva)
-├── Blueprint.md         (Malva Product & Technical Blueprint v1)
-├── HANDOFF.md           (Dokumentasi progress & handoff terupdate)
-├── requirements.txt     (Daftar dependensi runtime)
-└── malva/               (Semua modul aplikasi Malva)
-    ├── ai/              (AI Orchestrator & Cross-Meeting memory)
-    ├── asr/             (ASR Model Router & cache detection)
-    ├── audio/           (Dual-track capture: Mic dengan live 5-bar spectrum + System Audio)
-    ├── desktop/         (Desktop Tool Gateway & Permissions)
-    │   └── tools/       (Suite otomasi desktop, browser, shell)
-    ├── interview/       (Interview Practice & Notes engines)
-    ├── meeting/         (Meeting Intelligence, ringkasan & action items)
-    ├── privacy/         # Hidden Mode (WDA_EXCLUDEFROMCAPTURE) manager
-    ├── shell/           (Session lifecycle, Focus Mode, Sleep Mode)
-    ├── storage/         (SQLite engine & memori lintas-sesi)
-    ├── transcript/      (Transcript core segment pipeline)
-    └── ui/              (Floating pill solid black UI & 5-bar spectrum)
-```
+| Mode | Sumber default | Catatan |
+|---|---|---|
+| Asisten | Mikrofon + audio sistem (track terpisah) | Audio sistem hanya konteks transkrip, tidak memicu panggilan AI sendiri |
+| Meeting | Audio sistem saja | |
+| Latihan wawancara | Mikrofon | Pertanyaan dan jawaban hanya maju lewat aksi eksplisit |
+| Catatan wawancara | Mikrofon | |
+| Input suara | Mikrofon saja | Menolak audio sistem; hasil hanya ditampilkan untuk disalin |
 
----
+Aturan dasar: audio sistem **tidak pernah** diam-diam dialihkan ke mikrofon. Jika loopback gagal, sumber dilaporkan gagal dengan `capture_error` yang bertipe.
 
-## 2. Rincian Perbaikan Bug Terkini (Critical Fixes) ✅
+## 3. Privasi
 
-1. **Sisa Kotak Putih & Sudut Window**:
-   - `transparent=True` pada WebView2 menyebabkan clear-color default putih bocor di ujung sudut rounded.
-   - Solusi: Window diatur ke `background_color="#000000"`, `transparent=False`, dengan `html, body` solid `#000000`.
-   - Menambahkan panggilan native Win32 DWM `DwmSetWindowAttribute(hwnd, 33, DWMWCP_ROUND)` untuk pembulatan native Windows 11.
-2. **Menghapus Warna Ungu & Glass**:
-   - Menghapus semua color token ungu (`#6366f1`, `#818cf8`, `#a5b4fc`).
-   - Menghapus `backdrop-filter: blur()`. Menggunakan warna solid hitam `#000000` dengan kontras tinggi.
-3. **Spectrum Hilang & Tidak Bisa Listening**:
-   - Memulihkan **5-bar Spectrum Visualizer** di statusbar floating pill.
-   - Di `malva/audio/capture.py`: Menambahkan kalkulasi RMS 5-band per chunk audio dan callback `on_levels`.
-   - Di `malva/shell/session.py` & `app.py`: Meneruskan event `audio_levels` secara live ke JavaScript `window.updateBars(levels)`.
-   - Mengatasi masalah stream mic gagal dengan menambahkan sample rate fallback (`16000`, `44100`, `48000` Hz) dan VAD pre-buffering.
+- Default **lokal saja**. Cloud diaktifkan hanya lewat tombol "Izinkan cloud" di tab Setelan, disimpan di tabel `app_settings` (kunci `cloud_processing`), dan bisa dicabut.
+- Variabel lingkungan atau URL tidak dianggap persetujuan.
+- Google STT hanya dipakai setelah opt-in. Endpoint LLM non-localhost juga hanya dipakai setelah opt-in. Jika model lokal gagal, sistem **tidak** fallback ke cloud; pengguna diberi pesan.
+- Hidden Mode memakai `SetWindowDisplayAffinity` (WDA_EXCLUDEFROMCAPTURE). Ini **bukan** jaminan tidak terlihat. Status yang ditampilkan jujur: `disabled`, `active`, `unsupported` (Windows terlalu lama), `failed`.
 
----
+## 4. Kontrak event (sumber kebenaran: `EVENT_TYPES` di `malva/shell/session.py`)
 
-## 3. Cara Menjalankan 🚀
+Session dan engine memancarkan event berikut ke `app.py`, yang meneruskannya ke halaman lewat fungsi `window.<nama>`:
 
-Jalankan di terminal PowerShell:
+`session_started`, `session_ended`, `source_state`, `capture_error`, `state_change`, `transcript_segment`, `audio_levels`, `ai_start`, `ai_chunk`, `ai_end`, `ai_error`, `action_proposed`, `action_result`, `voice_input_text`, `focus_mode`, `sleep_mode`, `interview_question`, `interview_answer_draft`, `interview_feedback`, `interview_report`, `meeting_report`, `asr_error`, `report_error`, `notice`.
 
-```powershell
-python app.py
-```
-- Jendela solid black floating pill Malva akan langsung terbuka di desktop dengan sudut rounded rapi tanpa sisa putih.
-- Saat berbicara ke mic, 5 bar visualizer akan langsung bergerak/menari mengikuti intensitas suara Anda.
+Callback privasi memakai komponen `cloud_processing` dan `hidden_mode`. Itu bukan event sesi.
+
+Test `tests/test_event_contract.py` memastikan: setiap event yang dipancarkan ada di daftar, setiap item daftar benar-benar dipancarkan, dan setiap item ditangani di `app.py`.
+
+## 5. Yang sudah diverifikasi lewat test (Linux, 87 test)
+
+Jalankan: `pip install -r requirements-dev.txt && python3 -m pytest -q tests/`
+
+- `test_analysis.py`: pemetaan band sinus, band log-spaced, senyap, rentang nilai, decay, input buruk, reset, padding, error konfigurasi.
+- `test_devices_and_capture.py`: pemilihan loopback, mic tidak pernah dipakai sebagai fallback sistem, WASAPI tidak ada, mic default tidak ada, kegagalan buka di semua sample rate, format stereo loopback, tidak ada track ganda, voice_input menolak audio sistem, level diberi tag sumber. Memakai fake PyAudio.
+- `test_privacy_and_policy.py`: klasifikasi endpoint, cloud mati secara default, opt-in tersimpan dan bisa dicabut, DB gagal = fail-closed, ASR tanpa Google tanpa opt-in, LLM remote diblokir tanpa HTTP call, matriks sleep, parsing sleep.
+- `test_session_flow.py`: SQLite nyata di folder sementara; startup per mode; invariant pause/sleep/focus; ucapan hanya mengusulkan aksi; approve/reject; instruksi ketik berjalan; audio sistem hanya konteks; model lokal hilang dilaporkan; latihan wawancara eksplisit; stop melepas sumber.
+- `test_ui_contract.py`: skrip inline lolos `node --check`; setiap `_call("…")` di `app.py` punya fungsi `window.…`; setiap method API yang dipanggil JS ada di `MalvaAPI`; tidak ada interpolasi template di skrip; setiap kelas CSS yang dipakai punya aturan.
+- `test_event_contract.py`: lihat §4.
+
+Mutation check: tiga perbaikan pada modul inti (audio, privasi, session) sengaja dibatalkan satu per satu, dan tiap mutasi tertangkap oleh test. Satu mutasi pada kontrak UI (nama fungsi `showVoiceText` diubah) juga tertangkap. Setelah itu file dipulihkan dan diverifikasi dengan `cmp`.
+
+## 6. Yang TIDAK diverifikasi
+
+Semua ini membutuhkan Windows dan belum pernah diuji:
+
+- Loopback WASAPI dengan perangkat audio nyata; PyAudio mikrofon nyata.
+- Render WebView2, transparansi dan sudut membulat DWM, posisi awal jendela.
+- Seret jendela (`start_drag`).
+- Hotkey dan perilaku always-on-top.
+- Hidden Mode (`SetWindowDisplayAffinity`) dan label statusnya di UI.
+- Pemuatan model Whisper dari Hugging Face di CPU Windows.
+- Tampilan pill di layar kecil dan skala DPI.
+
+Daftar QA manual lengkap ada di `Malva_Repository_Audit_and_Agent_Prompt_v2.md`.
+
+## 7. Belum dikerjakan dari blueprint
+
+- **Windows-MCP (P2)**: dispatch aksi desktop masih lewat `malva/desktop/tools/runner.py`. Jangan dihapus sebelum penggantinya ada (sesuai catatan audit).
+- **Qwen3-ASR**: belum ditambahkan.
+- **VAD untuk wawancara**: belum.
+- **Memori lintas meeting**: belum.
+- **Keputusan-ke-eksekusi**: belum. Saat ini aksi dari ucapan hanya menjadi usulan yang harus disetujui.
+- **Screen-aware** dan **jembatan multibahasa**: belum.
+- **Drag**: kode ada, belum divalidasi di Windows.
+
+## 8. Klaim audit yang sudah usang
+
+- **P0.4** (nama event segmen): sebagian sudah benar di HEAD. Sekarang dicakup test kontrak event.
+- **P0.5** (stuck processing): sebagian sudah benar di HEAD. Sekarang setiap jalur pemrosesan berakhir di state yang benar (listening, paused, sleeping, atau error).
+- **P0.6**: sebagian sudah benar di HEAD. Sisanya diperbaiki di perubahan ini.
+- **P0.7** (auto-sleep): sebelumnya tidak pernah aktif, karena LISTENING mode asisten selalu mereset timer. Sekarang timer direset hanya oleh ucapan atau teks yang diketik, dan mode yang menangkap audio (Meeting, Latihan) dikecualikan dari auto-sleep.
+
+## 9. Status git dan push
+
+- Perubahan di-commit secara lokal di `/home/claude/nana`.
+- **Push ditolak**: Claude GitHub App belum punya akses ke `fattan-malva/nana` untuk organisasi ini. Perbaikan: pasang Claude GitHub App di https://github.com/apps/claude/installations/select_target, atau sambungkan ulang GitHub di https://claude.ai/customize/connectors?auth_start=github&auth_start_force=1. Setelah itu, push bisa diulang.
+
+## 10. Konfigurasi
+
+- Salin `.env.example` menjadi `.env`. Default-nya lokal saja.
+- Isi `OLLAMA_MODEL` dengan model yang sudah ditarik secara lokal.
+- `SLEEP_AFTER_SECONDS=60`; isi `0` untuk menonaktifkan auto-sleep.
+- Jalankan di Windows: `pip install -r requirements.txt` lalu `python app.py`.

@@ -104,7 +104,8 @@ class TranscriptCore:
             confidence=confidence,
             start_ms=start_ms,
             end_ms=end_ms,
-            track_id=track_id,
+            # Empty string would violate the audio_tracks foreign key; NULL means "no track".
+            track_id=track_id or None,
             raw_json=json.dumps(raw or {}),
         )
         evt = {

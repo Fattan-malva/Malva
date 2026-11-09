@@ -1,0 +1,8 @@
+# Dependensi untuk menjalankan test saja (bukan untuk menjalankan aplikasi).
+# Test memakai fake audio, jadi tidak membutuhkan mikrofon, WASAPI, atau Windows.
+# Sengaja TIDAK memakai requirements.txt: di sana ada pyaudio, pywinauto, dan
+# pywebview yang hanya dipasang di Windows.
+pytest>=8.0
+numpy==2.2.6
+httpx==0.27.0
+python-dotenv==1.0.1

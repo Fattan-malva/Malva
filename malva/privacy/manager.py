@@ -1,57 +1,108 @@
 """
-malva.privacy.manager — Privacy and permission management (Blueprint §11).
+malva.privacy.manager — Processing policy, cloud opt-in, and Hidden Mode (Blueprint §11).
 
-Hidden Mode uses SetWindowDisplayAffinity (WDA_EXCLUDEFROMCAPTURE).
-This is NOT a universal invisibility guarantee. Status is always reported honestly.
+Single source of truth for "may this data leave the machine?":
 
-Status values:
-  active      : capture exclusion successfully applied
-  unsupported : Windows version does not support WDA_EXCLUDEFROMCAPTURE
-  failed      : API call failed
-  disabled    : hidden mode not active
+  * cloud_processing is OFF by default and is only turned on by an explicit
+    user action (set_cloud_processing(True)). It is persisted in app_settings.
+  * It is NOT inferred from environment variables or endpoint URLs. Earlier
+    code treated "OLLAMA_URL is not localhost" as consent, which silently
+    sent audio and prompts to a cloud provider.
+  * ASR (Google STT) and the LLM (remote endpoints) both ask this manager
+    before any network call. Blocked calls return a typed reason so the UI
+    can say what is missing (e.g. "download a local model").
+
+Hidden Mode uses SetWindowDisplayAffinity (WDA_EXCLUDEFROMCAPTURE). It is NOT
+a universal invisibility guarantee; status is always reported honestly.
 """
 
 from __future__ import annotations
 
 import ctypes
-import ctypes.wintypes
+import ctypes.wintypes  # noqa: F401  (used by Hidden Mode on Windows)
 from enum import Enum
 from typing import Callable
+from urllib.parse import urlparse
 
 # WDA_EXCLUDEFROMCAPTURE = 0x11 (Windows 10 2004+)
 WDA_NONE                = 0x00
-WDA_MONITOR             = 0x01
 WDA_EXCLUDEFROMCAPTURE  = 0x11
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def is_remote_endpoint(url: str) -> bool:
+    """True when `url` points somewhere other than this machine. Empty = not remote."""
+    if not url or not url.strip():
+        return False
+    host = (urlparse(url.strip()).hostname or "").lower()
+    if not host:
+        # Unparseable input is treated as remote: fail closed.
+        return True
+    return host not in _LOCAL_HOSTS
 
 
 class HiddenModeStatus(str, Enum):
-    DISABLED     = "disabled"
-    ACTIVE       = "active"
-    UNSUPPORTED  = "unsupported"
-    FAILED       = "failed"
+    DISABLED    = "disabled"
+    ACTIVE      = "active"
+    UNSUPPORTED = "unsupported"
+    FAILED      = "failed"
 
 
 class PrivacyManager:
-    """
-    Manages Hidden Mode and audio permission state.
-    Does not silently alter recording indicators or other app state.
-    """
+    """Holds the processing policy and Hidden Mode state."""
 
-    def __init__(self, on_status_change: Callable[[str, str], None] | None = None):
-        """on_status_change(component, status_string) — called on any status change."""
+    SETTING_KEY = "cloud_processing"
+
+    def __init__(
+        self,
+        on_status_change: Callable[[str, str], None] | None = None,
+        db=None,
+    ):
+        """on_status_change(component, status_string) is called on every change."""
         self._on_status_change  = on_status_change
+        self._db                = db
         self.hidden_mode_status = HiddenModeStatus.DISABLED
         self._hwnd: int | None  = None
-        self.cloud_processing   = False   # opt-in only
-        
-        # Auto-detect local_only based on OLLAMA_URL
-        # If OLLAMA_URL points to localhost/127.0.0.1, allow it even with local_only
-        # If explicitly set to cloud endpoint, assume user wants cloud processing
-        import os
-        ollama_url = os.getenv("OLLAMA_URL", "")
-        is_local_ollama = any(h in ollama_url.lower() for h in ("localhost", "127.0.0.1", "::1"))
-        # Default to local_only UNLESS user explicitly configured cloud Ollama
-        self.local_only = not ollama_url or is_local_ollama
+        self.cloud_processing   = self._load_cloud_setting()
+
+    # ------------------------------------------------------------------ policy
+
+    @property
+    def local_only(self) -> bool:
+        return not self.cloud_processing
+
+    def allows_cloud_asr(self) -> bool:
+        """Google STT (or any cloud speech API) may be used only with explicit opt-in."""
+        return self.cloud_processing
+
+    def allows_remote_endpoint(self, url: str) -> bool:
+        """LLM endpoints: localhost is always fine; remote needs explicit opt-in."""
+        return (not is_remote_endpoint(url)) or self.cloud_processing
+
+    def set_cloud_processing(self, enabled: bool) -> None:
+        """Explicit user action only. Persisted so the choice survives restarts."""
+        self.cloud_processing = bool(enabled)
+        if self._db is not None:
+            try:
+                self._db.set_setting(self.SETTING_KEY, "1" if enabled else "0")
+            except Exception as e:
+                print(f"[privacy] could not persist cloud setting: {e}")
+        self._notify("cloud_processing", "enabled" if enabled else "disabled")
+
+    def enable_cloud_processing(self) -> None:
+        self.set_cloud_processing(True)
+
+    def disable_cloud_processing(self) -> None:
+        self.set_cloud_processing(False)
+
+    def _load_cloud_setting(self) -> bool:
+        if self._db is None:
+            return False
+        try:
+            return self._db.get_setting(self.SETTING_KEY, "0") == "1"
+        except Exception:
+            return False  # fail closed
 
     # ------------------------------------------------------------------ Hidden Mode
 
@@ -59,80 +110,52 @@ class PrivacyManager:
         self._hwnd = hwnd
 
     def enable_hidden_mode(self) -> HiddenModeStatus:
-        """
-        Attempt to exclude the Malva window from screen capture.
-        Always reports the actual result — never lies about compatibility.
-        """
+        """Attempt capture exclusion. Reports the actual outcome."""
         if self._hwnd is None:
-            self.hidden_mode_status = HiddenModeStatus.FAILED
-            self._notify("hidden_mode", HiddenModeStatus.FAILED)
-            return HiddenModeStatus.FAILED
-
+            return self._set_hidden(HiddenModeStatus.FAILED)
         try:
             user32 = ctypes.windll.user32
-            # Check if the function accepts WDA_EXCLUDEFROMCAPTURE
             ret = user32.SetWindowDisplayAffinity(
                 ctypes.wintypes.HWND(self._hwnd),
                 ctypes.c_uint(WDA_EXCLUDEFROMCAPTURE),
             )
             if ret:
-                self.hidden_mode_status = HiddenModeStatus.ACTIVE
-                self._notify("hidden_mode", HiddenModeStatus.ACTIVE)
-                return HiddenModeStatus.ACTIVE
-            else:
-                # Might be unsupported version
-                err = ctypes.get_last_error()
-                if err == 87:  # ERROR_INVALID_PARAMETER
-                    self.hidden_mode_status = HiddenModeStatus.UNSUPPORTED
-                    self._notify("hidden_mode", HiddenModeStatus.UNSUPPORTED)
-                    return HiddenModeStatus.UNSUPPORTED
-                self.hidden_mode_status = HiddenModeStatus.FAILED
-                self._notify("hidden_mode", HiddenModeStatus.FAILED)
-                return HiddenModeStatus.FAILED
-        except Exception:
-            self.hidden_mode_status = HiddenModeStatus.UNSUPPORTED
-            self._notify("hidden_mode", HiddenModeStatus.UNSUPPORTED)
-            return HiddenModeStatus.UNSUPPORTED
+                return self._set_hidden(HiddenModeStatus.ACTIVE)
+            err = ctypes.get_last_error()
+            if err == 87:  # ERROR_INVALID_PARAMETER: Windows build too old
+                return self._set_hidden(HiddenModeStatus.UNSUPPORTED)
+            return self._set_hidden(HiddenModeStatus.FAILED)
+        except Exception as e:
+            print(f"[privacy] hidden mode unavailable: {e}")
+            return self._set_hidden(HiddenModeStatus.UNSUPPORTED)
 
     def disable_hidden_mode(self) -> None:
-        if self._hwnd is None:
-            return
-        try:
-            user32 = ctypes.windll.user32
-            user32.SetWindowDisplayAffinity(
-                ctypes.wintypes.HWND(self._hwnd),
-                ctypes.c_uint(WDA_NONE),
-            )
-        except Exception:
-            pass
-        self.hidden_mode_status = HiddenModeStatus.DISABLED
-        self._notify("hidden_mode", HiddenModeStatus.DISABLED)
+        if self._hwnd is not None:
+            try:
+                ctypes.windll.user32.SetWindowDisplayAffinity(
+                    ctypes.wintypes.HWND(self._hwnd), ctypes.c_uint(WDA_NONE),
+                )
+            except Exception as e:
+                print(f"[privacy] could not clear display affinity: {e}")
+        self._set_hidden(HiddenModeStatus.DISABLED)
 
-    # ------------------------------------------------------------------ cloud processing
+    def _set_hidden(self, status: HiddenModeStatus) -> HiddenModeStatus:
+        self.hidden_mode_status = status
+        self._notify("hidden_mode", status.value)
+        return status
 
-    def enable_cloud_processing(self) -> None:
-        """Cloud processing is opt-in only — never enabled silently."""
-        self.cloud_processing = True
-        self.local_only       = False
-        self._notify("cloud_processing", "enabled")
-
-    def disable_cloud_processing(self) -> None:
-        self.cloud_processing = False
-        self.local_only       = True
-        self._notify("cloud_processing", "disabled")
-
-    # ------------------------------------------------------------------ status summary
+    # ------------------------------------------------------------------ status
 
     def get_status(self) -> dict:
         return {
-            "hidden_mode":       self.hidden_mode_status.value,
-            "cloud_processing":  self.cloud_processing,
-            "local_only":        self.local_only,
+            "hidden_mode":      self.hidden_mode_status.value,
+            "cloud_processing": self.cloud_processing,
+            "local_only":       self.local_only,
         }
 
-    # ------------------------------------------------------------------ internal
-
-    def _notify(self, component: str, status) -> None:
+    def _notify(self, component: str, status: str) -> None:
         if self._on_status_change:
-            self._on_status_change(component, str(status.value if hasattr(status, "value") else status))
-
+            try:
+                self._on_status_change(component, status)
+            except Exception as e:
+                print(f"[privacy] status callback failed: {e}")

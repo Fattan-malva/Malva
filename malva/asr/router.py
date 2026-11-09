@@ -60,6 +60,11 @@ class ASRResult:
         }
 
 
+# Sentinel values for ASRResult.model_used when no transcript was produced.
+# The session reads these to tell the user what is missing.
+LOCAL_MODEL_REQUIRED = "local-model-required"
+LOCAL_FAILED         = "local-failed"
+
 # ------------------------------------------------------------------ model metadata
 
 AVAILABLE_MODELS = {
@@ -209,8 +214,17 @@ class ASRRouter:
 
     @property
     def model_info(self) -> dict:
+        if self._model_name:
+            default_label = self._model_name
+        elif self._is_loading:
+            default_label = "Sedang memuat…"
+        elif self._cloud_allowed():
+            default_label = "Cloud (Google STT, diizinkan)"
+        else:
+            default_label = "Belum ada model lokal"
         return {
-            "model": self._model_name or ("Sedang memuat…" if self._is_loading else "Cloud (Google STT)"),
+            "model": default_label,
+            "cloud_allowed": self._cloud_allowed(),
             "model_size": self.model_size,
             "device": self.device,
             "language_setting": self.language,
@@ -248,14 +262,18 @@ class ASRRouter:
         if local_model is not None:
             result = self._transcribe_local(local_model, wav_bytes)
         else:
-            if self._privacy and self._privacy.local_only:
-                print("[asr] local_only enforced: no local model, cloud blocked")
-                result = ASRResult(full_text="", language="und", model_used="none-available")
-            else:
+            if self._cloud_allowed():
                 result = self._transcribe_cloud(wav_bytes)
+            else:
+                # Local-first: never upload audio without explicit user opt-in.
+                result = ASRResult(full_text="", language="und", model_used=LOCAL_MODEL_REQUIRED)
 
         result.duration_ms = (time.time() - t0) * 1000
         return result
+
+    def _cloud_allowed(self) -> bool:
+        """Fail closed: without a privacy manager, cloud speech is never used."""
+        return bool(self._privacy is not None and self._privacy.allows_cloud_asr())
 
     def _transcribe_local(self, model, wav_bytes: bytes) -> ASRResult:
         """faster-whisper transcription with per-segment language detection."""
@@ -292,9 +310,8 @@ class ASRRouter:
             )
         except Exception as e:
             print(f"[asr/local] error: {e}")
-            if self._privacy and self._privacy.local_only:
-                print("[asr] local_only enforced: cloud fallback blocked")
-                return ASRResult(full_text="", language="und", model_used="local-failed")
+            if not self._cloud_allowed():
+                return ASRResult(full_text="", language="und", model_used=LOCAL_FAILED)
             return self._transcribe_cloud(wav_bytes)
 
     def _transcribe_cloud(self, wav_bytes: bytes) -> ASRResult:

@@ -23,9 +23,10 @@ from typing import Callable, Iterator
 
 import httpx
 
+from malva.privacy.manager import is_remote_endpoint
 from malva.storage.db import Database
 
-OLLAMA_URL   = os.getenv("OLLAMA_URL",   "https://ollama.com/v1/chat/completions")
+OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://localhost:11434/v1/chat/completions")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:31b-cloud")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
 
@@ -95,6 +96,7 @@ class AIOrchestrator:
         self._db        = db
         self._privacy   = privacy_manager
         self._history: list[dict] = []
+        self.on_error: Callable[[str], None] | None = None
         self._running   = True
         self._headers   = {"Content-Type": "application/json"}
         if OLLAMA_API_KEY:
@@ -189,6 +191,33 @@ class AIOrchestrator:
             pass
         return []
 
+    # ------------------------------------------------------------------ policy
+
+    def _endpoint_allowed(self) -> bool:
+        """Every LLM request goes through here. Fail closed."""
+        url = OLLAMA_URL.strip()
+        if not url:
+            self._report_error("Endpoint AI belum diatur (OLLAMA_URL kosong).")
+            return False
+        if self._privacy is None:
+            allowed = not is_remote_endpoint(url)
+        else:
+            allowed = self._privacy.allows_remote_endpoint(url)
+        if not allowed:
+            self._report_error(
+                "AI lokal belum berjalan. Jalankan Ollama di komputer ini, "
+                "atau aktifkan cloud secara eksplisit di Setelan."
+            )
+        return allowed
+
+    def _report_error(self, message: str) -> None:
+        print(f"[ai] {message}")
+        if self.on_error:
+            try:
+                self.on_error(message)
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------ LLM internals
 
     def _build_messages(self, user_text: str, extra_context: str = "") -> list[dict]:
@@ -210,15 +239,8 @@ class AIOrchestrator:
         on_chunk: Callable[[str], None] | None,
     ) -> tuple[str, dict | None]:
         """Stream LLM response. Returns (emitted_text, action_or_None)."""
-        # Only block if local_only AND endpoint is actually remote (not localhost)
-        if self._privacy and self._privacy.local_only:
-            is_remote = "ollama.com" in OLLAMA_URL.lower() or (
-                "localhost" not in OLLAMA_URL.lower() and 
-                "127.0.0.1" not in OLLAMA_URL.lower()
-            )
-            if is_remote:
-                print("[ai] local_only enforced: cloud LLM blocked")
-                return "", None
+        if not self._endpoint_allowed():
+            return "", None
 
         emitted:  list[str] = []
         buffered  = ""
@@ -316,15 +338,8 @@ class AIOrchestrator:
         messages: list[dict],
         on_chunk: Callable[[str], None] | None,
     ) -> tuple[str, dict | None]:
-        # Only block if local_only AND endpoint is actually remote
-        if self._privacy and self._privacy.local_only:
-            is_remote = "ollama.com" in OLLAMA_URL.lower() or (
-                "localhost" not in OLLAMA_URL.lower() and 
-                "127.0.0.1" not in OLLAMA_URL.lower()
-            )
-            if is_remote:
-                print("[ai] local_only enforced: cloud LLM fallback blocked")
-                return "", None
+        if not self._endpoint_allowed():
+            return "", None
         try:
             with httpx.Client(timeout=120.0) as client:
                 resp = client.post(

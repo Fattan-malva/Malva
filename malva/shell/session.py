@@ -2,10 +2,22 @@
 malva.shell.session — Session lifecycle manager.
 
 Each session:
-  - Has a mode (assistant|meeting|interview_practice|interview_notes|voice_input)
+  - Has a mode (assistant | meeting | interview_practice | interview_notes | voice_input)
   - Owns an AudioEngine, ASRRouter, TranscriptCore, AIOrchestrator, and mode engine
-  - Manages Focus Mode and Sleep Mode state
-  - Sends events to the UI via the event callback
+  - Emits canonical events to the UI (see EVENT_TYPES below)
+
+Behaviour guarantees:
+  * Sources start per Blueprint §4. A source that fails to open is reported
+    with a typed capture_error; it is never replaced by another source.
+  * Every processing path ends in a correct state (listening / paused /
+    sleeping / error). Focus does not change the state.
+  * Speech never executes desktop actions on its own. An action proposed
+    from speech becomes a pending item that the user must approve.
+  * Interview Practice advances only on explicit user actions: start,
+    finish answer, next question. Speech is never treated as an answer
+    unless a question is pending.
+  * System audio in Assistant mode is kept as transcript context only and
+    does not trigger AI calls by itself.
 """
 
 from __future__ import annotations
@@ -15,18 +27,42 @@ import time
 import uuid
 from typing import Callable
 
+from malva.asr.router import LOCAL_FAILED, LOCAL_MODEL_REQUIRED, ASRRouter
 from malva.audio.capture import AudioEngine, TrackSource
-from malva.asr.router import ASRRouter
-from malva.transcript.core import TranscriptCore
+from malva.audio.devices import AudioDeviceError
 from malva.ai.orchestrator import AIOrchestrator
-from malva.meeting.engine import MeetingEngine
-from malva.interview.engine import InterviewEngine
 from malva.desktop.gateway import DesktopGateway
+from malva.interview.engine import InterviewEngine
+from malva.meeting.engine import MeetingEngine
 from malva.privacy.manager import PrivacyManager
 from malva.storage.db import Database
+from malva.transcript.core import TranscriptCore
 
 
 MODES = ("assistant", "meeting", "interview_practice", "interview_notes", "voice_input")
+
+# Sources each mode starts by default (Blueprint §4).
+DEFAULT_SOURCES: dict[str, tuple[TrackSource, ...]] = {
+    "assistant":          (TrackSource.MICROPHONE, TrackSource.SYSTEM_AUDIO),
+    "meeting":            (TrackSource.SYSTEM_AUDIO,),
+    "interview_practice": (TrackSource.MICROPHONE,),
+    "interview_notes":    (TrackSource.MICROPHONE,),
+    "voice_input":        (TrackSource.MICROPHONE,),
+}
+
+# Canonical event contract (documented in HANDOFF.md). The UI bridge in app.py
+# maps each of these to a JavaScript function.
+EVENT_TYPES = (
+    "session_started", "session_ended", "source_state", "capture_error",
+    "state_change", "transcript_segment", "audio_levels",
+    "ai_start", "ai_chunk", "ai_end", "ai_error",
+    "action_proposed", "action_result",
+    "voice_input_text", "focus_mode", "sleep_mode",
+    "interview_question", "interview_answer_draft", "interview_feedback", "interview_report",
+    "meeting_report", "asr_error", "report_error", "notice",
+)
+
+_ASR_NOTICE_COOLDOWN = 30.0
 
 
 class SessionState:
@@ -35,17 +71,10 @@ class SessionState:
     PROCESSING = "processing"
     PAUSED     = "paused"
     SLEEPING   = "sleeping"
-    FOCUSED    = "focused"
     ERROR      = "error"
 
 
 class MalvaSession:
-    """
-    One active Malva session. Owns audio → ASR → transcript → AI pipeline.
-    Focus Mode: session remains active, suppress non-essential notifications.
-    Sleep Mode: audio pipeline stopped, state saved.
-    """
-
     def __init__(
         self,
         mode: str,
@@ -54,35 +83,45 @@ class MalvaSession:
         desktop: DesktopGateway,
         privacy: PrivacyManager,
         on_event: Callable[[dict], None],
-        asr_language: str = "auto",
+        focus_mode: bool = False,
     ):
-        assert mode in MODES, f"Unknown mode: {mode}"
-        self.session_id  = uuid.uuid4().hex
-        self.mode        = mode
-        self._db         = db
-        self._asr        = asr_router
-        self._desktop    = desktop
-        self._privacy    = privacy
-        self._on_event   = on_event
+        if mode not in MODES:
+            raise ValueError(f"Unknown mode: {mode}")
+        self.session_id = uuid.uuid4().hex
+        self.mode       = mode
+        self._db        = db
+        self._asr       = asr_router
+        self._desktop   = desktop
+        self._privacy   = privacy
+        self._on_event  = on_event
 
-        self.state       = SessionState.IDLE
-        self.focus_mode  = False
-        self._running    = False
-        self._lock       = threading.Lock()
+        self.state      = SessionState.IDLE
+        self.focus_mode = bool(focus_mode)     # app-level preference, mirrored here
+        self._running   = False
+        self._paused    = False
+        self._sleeping  = False
+        self._lock      = threading.RLock()
+        self._last_activity = time.time()
+        self._pending: dict[str, dict] = {}
+        self._asr_notice_at = 0.0
 
-        # Pipeline components
+        # Interview Practice turn state
+        self._practice_question = ""
+        self._practice_answer: list[str] = []
+
         self._audio = AudioEngine(
             session_id=self.session_id,
             mode=mode,
             on_utterance=self._on_utterance,
             on_levels=self._on_audio_levels,
+            on_error=self._on_capture_error,
             db=db,
         )
         self._transcript = TranscriptCore(session_id=self.session_id, db=db)
         self._ai = AIOrchestrator(session_id=self.session_id, mode=mode, db=db, privacy_manager=privacy)
+        self._ai.on_error = self._on_ai_error
 
-        # Mode engines
-        self._meeting:   MeetingEngine   | None = None
+        self._meeting:   MeetingEngine | None = None
         self._interview: InterviewEngine | None = None
         if mode == "meeting":
             self._meeting = MeetingEngine(self.session_id, self._ai, db, self._transcript)
@@ -94,186 +133,358 @@ class MalvaSession:
             if mode == "interview_notes":
                 self._transcript.add_listener(self._interview.on_segment)
 
-        # Transcript always routes to AI for assistant mode
         if mode == "assistant":
             self._transcript.add_listener(self._on_transcript_event)
 
-        # Create DB record
         db.create_session(self.session_id, mode)
 
     # ------------------------------------------------------------------ start / stop
 
     def start(self) -> None:
-        """Start audio capture according to mode invariants."""
-        if self._running:
-            return
-        self._running = True
-        self.state    = SessionState.LISTENING
-        self._emit({"type": "state_change", "state": SessionState.LISTENING})
+        """Open the sources this mode needs. Failures are reported, not swallowed."""
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+            self._paused = False
+            self._sleeping = False
 
-        if self.mode == "assistant":
-            self._audio.start_microphone()
-            self._audio.start_system_audio()
-        elif self.mode == "interview_practice":
-            self._audio.start_microphone()
-        elif self.mode == "meeting":
-            self._audio.start_system_audio()
-        elif self.mode == "interview_notes":
-            self._audio.start_microphone()
-            # system audio optional — not auto-started
-        elif self.mode == "voice_input":
-            self._audio.start_microphone()
-            # system audio MUST NOT be started in voice_input (Blueprint §4)
+        for source in DEFAULT_SOURCES[self.mode]:
+            self._open_source(source)
 
-        self._emit({"type": "session_started", "session_id": self.session_id,
-                    "mode": self.mode, "sources": [s.value for s in self._audio.active_sources]})
+        self.touch()
+        active = self._audio.active_sources
+        self._emit({
+            "type": "session_started",
+            "session_id": self.session_id,
+            "mode": self.mode,
+            "sources": [s.value for s in active],
+            "source_states": self._audio.source_states(),
+        })
+        if active:
+            self._set_state(SessionState.LISTENING)
+        else:
+            self._set_state(SessionState.ERROR)
 
-    def stop(self) -> str | None:
-        """Stop session. Returns finalized report JSON if applicable."""
-        self._running = False
+    def stop(self) -> None:
+        """Stop capture immediately, then finalise reports in the background."""
+        with self._lock:
+            self._running = False
+            self._paused = False
+            self._sleeping = False
         self._audio.stop_all()
-        self._ai.stop()
-        self._db.end_session(self.session_id)
-        self.state = SessionState.IDLE
+        self._set_state(SessionState.IDLE)
+        try:
+            self._db.end_session(self.session_id)
+        except Exception as e:
+            print(f"[session] end_session failed: {e}")
+        self._emit({"type": "session_ended", "session_id": self.session_id, "mode": self.mode})
+        threading.Thread(target=self._finalize_reports, daemon=True, name="finalize").start()
 
-        report = None
-        if self._meeting:
-            report = self._meeting.finalize()
-        elif self._interview:
-            if self.mode == "interview_practice":
-                report = self._interview.finalize_practice()
+    def _finalize_reports(self) -> None:
+        try:
+            if self._meeting:
+                self._meeting.finalize()
+            elif self.mode == "interview_notes" and self._interview:
+                self._interview.finalize_notes()
+            elif self.mode == "interview_practice" and self._interview:
+                self._interview.finalize_practice()
+        except Exception as e:
+            self._emit({"type": "report_error", "message": f"Laporan gagal dibuat: {e}"})
+
+    # ------------------------------------------------------------------ sources
+
+    def _open_source(self, source: TrackSource) -> bool:
+        try:
+            if source == TrackSource.MICROPHONE:
+                self._audio.start_microphone()
             else:
-                report = self._interview.finalize_notes()
+                self._audio.start_system_audio()
+            return True
+        except AudioDeviceError as e:
+            self._emit({"type": "capture_error", "source": source.value,
+                        "code": e.code, "message": e.message})
+        except ValueError as e:  # mode invariant (e.g. voice_input + system audio)
+            self._emit({"type": "capture_error", "source": source.value,
+                        "code": "MODE_RULE", "message": str(e)})
+        self._emit_source_states()
+        return False
 
-        self._emit({"type": "session_ended", "session_id": self.session_id,
-                    "mode": self.mode, "report": report})
-        return report
+    def enable_source(self, source: TrackSource) -> bool:
+        """User toggled a source on from the UI. Mode rules still apply."""
+        ok = self._open_source(source)
+        self._emit_source_states()
+        if ok and self.state == SessionState.ERROR:
+            self._set_state(SessionState.LISTENING)
+        return ok
+
+    def disable_source(self, source: TrackSource) -> None:
+        self._audio.stop_track(source)
+        self._emit_source_states()
+        if self._running and not self._audio.active_sources:
+            self._set_state(SessionState.ERROR)
+
+    def _emit_source_states(self) -> None:
+        self._emit({"type": "source_state", "states": self._audio.source_states(),
+                    "active": [s.value for s in self._audio.active_sources]})
+
+    # ------------------------------------------------------------------ pause / sleep / focus
 
     def pause(self) -> None:
+        self._paused = True
         self._audio.pause_all()
-        self.state = SessionState.PAUSED
-        self._emit({"type": "state_change", "state": SessionState.PAUSED})
+        self._set_state(SessionState.PAUSED)
 
     def resume(self) -> None:
+        self._paused = False
+        if self._sleeping:
+            return
         self._audio.resume_all()
-        self.state = SessionState.LISTENING
-        self._ai.resume()
-        self._emit({"type": "state_change", "state": SessionState.LISTENING})
-
-    # ------------------------------------------------------------------ Focus Mode
-
-    def enable_focus_mode(self) -> None:
-        """
-        Focus Mode: session stays active, suppress non-essential notifications.
-        Does NOT silently change audio sources or Windows power policy.
-        """
-        self.focus_mode = True
-        self.state = SessionState.FOCUSED
-        self._emit({"type": "focus_mode", "enabled": True})
-
-    def disable_focus_mode(self) -> None:
-        self.focus_mode = False
-        self.state = SessionState.LISTENING
-        self._emit({"type": "focus_mode", "enabled": False})
-
-    # ------------------------------------------------------------------ Sleep Mode (preserved from Nana)
+        self._set_state(SessionState.LISTENING if self._audio.active_sources else SessionState.ERROR)
 
     def enter_sleep(self) -> None:
-        """Resource-saving state. Pauses audio pipeline."""
+        """Resource-saving state. Pauses capture; does not close devices."""
+        self._sleeping = True
         self._audio.pause_all()
-        self.state = SessionState.SLEEPING
+        self._set_state(SessionState.SLEEPING)
         self._emit({"type": "sleep_mode", "sleeping": True})
 
     def exit_sleep(self) -> None:
-        """Wake from sleep — resume audio pipeline."""
-        self._audio.resume_all()
-        self.state = SessionState.LISTENING
+        self._sleeping = False
+        self.touch()
+        if not self._paused:
+            self._audio.resume_all()
         self._emit({"type": "sleep_mode", "sleeping": False})
+        self._restore_state()
 
-    # ------------------------------------------------------------------ assistant interaction
+    def set_focus(self, enabled: bool) -> None:
+        """Focus changes only the flag. It never touches the session state."""
+        self.focus_mode = bool(enabled)
+        self._emit({"type": "focus_mode", "enabled": self.focus_mode})
+
+    # ------------------------------------------------------------------ activity
+
+    def touch(self) -> None:
+        self._last_activity = time.time()
+
+    @property
+    def idle_seconds(self) -> float:
+        return time.time() - self._last_activity
+
+    @property
+    def is_protected(self) -> bool:
+        """True when this mode must not be interrupted by automatic sleep."""
+        from malva.shell.policy import PROTECTED_MODES
+        return self.mode in PROTECTED_MODES
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def is_sleeping(self) -> bool:
+        return self._sleeping
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def status(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "mode": self.mode,
+            "state": self.state,
+            "focus_mode": self.focus_mode,
+            "sources": self._audio.source_states(),
+            "active_sources": [s.value for s in self._audio.active_sources],
+        }
+
+    # ------------------------------------------------------------------ typed input (assistant)
 
     def ask(self, text: str, on_chunk: Callable[[str], None] | None = None) -> str:
-        """Direct text interaction (typing or voice input, already transcribed)."""
-        self.state = SessionState.PROCESSING
-        self._emit({"type": "state_change", "state": SessionState.PROCESSING})
+        """Explicit typed instruction. Its tool action runs under the normal policy."""
+        self.touch()
+        self._set_state(SessionState.PROCESSING)
+        try:
+            full_text, action = self._ai.ask(text, on_chunk=on_chunk)
+            if action:
+                result = self._desktop.run(action["tool"], action.get("args", {}))
+                follow_up = (f"Tool result: {result['result']}" if result.get("ok")
+                             else f"Tool error: {result['error']}")
+                follow_text, _ = self._ai.ask(follow_up, on_chunk=on_chunk)
+                full_text = (full_text + " " + follow_text).strip()
+            return full_text
+        finally:
+            self._restore_state()
 
-        full_text, action = self._ai.ask(text, on_chunk=on_chunk)
+    # ------------------------------------------------------------------ pending actions
 
-        if action:
-            result = self._desktop.run(action["tool"], action.get("args", {}))
-            # Feed result back to AI for follow-up
-            if result.get("ok"):
-                follow_up = f"Tool result: {result['result']}"
-            else:
-                follow_up = f"Tool error: {result['error']}"
-            full_text2, _ = self._ai.ask(follow_up, on_chunk=on_chunk)
-            full_text = (full_text + " " + full_text2).strip()
+    def propose_action(self, tool: str, args: dict, origin: str = "speech") -> str:
+        pid = uuid.uuid4().hex[:12]
+        with self._lock:
+            self._pending[pid] = {"id": pid, "tool": tool, "args": args, "origin": origin}
+        self._emit({"type": "action_proposed", "action": dict(self._pending[pid])})
+        return pid
 
-        self.state = SessionState.LISTENING
-        self._emit({"type": "state_change", "state": SessionState.LISTENING})
-        return full_text
+    def pending_actions(self) -> list[dict]:
+        with self._lock:
+            return [dict(v) for v in self._pending.values()]
+
+    def approve_action(self, action_id: str) -> dict:
+        with self._lock:
+            action = self._pending.pop(action_id, None)
+        if action is None:
+            return {"ok": False, "error": "Aksi tidak ditemukan atau sudah diproses."}
+        result = self._desktop.run(action["tool"], action.get("args", {}))
+        self._emit({"type": "action_result", "id": action_id, "ok": bool(result.get("ok")),
+                    "message": str(result.get("error") or "Selesai")})
+        return result
+
+    def reject_action(self, action_id: str) -> None:
+        with self._lock:
+            removed = self._pending.pop(action_id, None)
+        if removed:
+            self._emit({"type": "action_result", "id": action_id, "ok": False,
+                        "message": "Dibatalkan oleh pengguna."})
+
+    # ------------------------------------------------------------------ interview practice
+
+    def start_practice(self, topic: str = "general", interview_type: str = "behavioral") -> str:
+        if self.mode != "interview_practice" or self._interview is None:
+            raise ValueError("Sesi ini bukan Latihan Wawancara.")
+        self.touch()
+        self._interview.set_interview_context(topic=topic, interview_type=interview_type)
+        self._practice_answer = []
+        return self._ask_next_practice_question()
+
+    def submit_practice_answer(self) -> str:
+        """User pressed 'Selesai menjawab'. Evaluates everything captured since the question."""
+        if self.mode != "interview_practice" or self._interview is None:
+            raise ValueError("Sesi ini bukan Latihan Wawancara.")
+        answer = " ".join(self._practice_answer).strip()
+        if not self._practice_question:
+            self._emit({"type": "notice", "message": "Mulai dengan pertanyaan terlebih dahulu."})
+            return ""
+        if not answer:
+            self._emit({"type": "notice", "message": "Belum ada jawaban yang terekam."})
+            return ""
+        self._practice_answer = []
+        self._set_state(SessionState.PROCESSING)
+        try:
+            return self._interview.evaluate_answer(answer)
+        finally:
+            self._restore_state()
+
+    def next_practice_question(self) -> str:
+        if self.mode != "interview_practice" or self._interview is None:
+            raise ValueError("Sesi ini bukan Latihan Wawancara.")
+        self._practice_answer = []
+        return self._ask_next_practice_question()
+
+    def _ask_next_practice_question(self) -> str:
+        self._set_state(SessionState.PROCESSING)
+        try:
+            question = self._interview.get_next_question()
+        finally:
+            self._restore_state()
+        if question:
+            self._practice_question = question
+        else:
+            self._emit({"type": "notice", "message": "Pertanyaan belum bisa dibuat. Periksa AI lokal."})
+        return question
+
+    def finish_practice(self) -> None:
+        """Generate the practice report in the background and show it when ready."""
+        if self._interview is None:
+            return
+        threading.Thread(target=self._finalize_reports, daemon=True, name="practice-report").start()
 
     # ------------------------------------------------------------------ pipeline
 
     def _on_utterance(self, wav_bytes: bytes, source: TrackSource, session_id: str) -> None:
-        """Called by AudioEngine when an utterance chunk is ready."""
-        if not self._running:
+        """Called by AudioEngine for each finished utterance (worker thread)."""
+        if not self._running or self._paused or self._sleeping:
             return
-        
+        self._set_state(SessionState.PROCESSING)
         try:
-            self.state = SessionState.PROCESSING
-            self._emit({"type": "state_change", "state": SessionState.PROCESSING})
-
-            # Transcribe
+            self.touch()
             self._asr.language = self._db.get_setting("asr_language", "auto")
             result = self._asr.transcribe(wav_bytes)
-            if not result.full_text.strip():
+
+            if result.model_used in (LOCAL_MODEL_REQUIRED, LOCAL_FAILED):
+                self._asr_problem(result.model_used)
                 return
 
-            # Store in transcript core (never overwrites raw text)
+            text = result.full_text.strip()
+            if not text:
+                return
+
             track = self._audio.get_track(source)
             track_id = track.track_id if track else ""
             self._transcript.ingest(result, track_id=track_id, source_type=source.value)
 
-            # For voice input mode: just emit transcription, no AI call
             if self.mode == "voice_input":
-                self._emit({"type": "voice_input_text", "text": result.full_text})
+                self._emit({"type": "voice_input_text", "text": text})
                 return
-
-            # For meeting / interview_notes: transcript already routed via listener
             if self.mode in ("meeting", "interview_notes"):
+                return  # listeners already handled the segment
+            if self.mode == "interview_practice":
+                if self._practice_question:
+                    self._practice_answer.append(text)
+                    self._emit({"type": "interview_answer_draft",
+                                "text": " ".join(self._practice_answer)})
                 return
+            if source == TrackSource.SYSTEM_AUDIO:
+                return  # assistant: system audio is context only, never an automatic prompt
 
-            # For assistant / interview_practice: send to AI
-            def on_chunk(chunk: str) -> None:
-                self._emit({"type": "ai_chunk", "text": chunk})
-
-            # Interview Practice mode: generate question or evaluate answer
-            if self.mode == "interview_practice" and self._interview:
-                # Check if we need first question
-                if not self._interview._practice.questions_asked:
-                    self._interview.get_next_question(on_chunk=on_chunk)
-                else:
-                    # Evaluate current answer and generate next question
-                    self._interview.evaluate_answer(result.full_text, on_chunk=on_chunk)
-                    self._interview.get_next_question(on_chunk=on_chunk)
-                return
-
-            full_text, action = self._ai.ask(result.full_text, on_chunk=on_chunk)
-
-            if action and self.mode == "assistant":
-                confirm_result = self._desktop.run(action["tool"], action.get("args", {}))
-                if confirm_result.get("ok"):
-                    follow = f"Tool executed: {confirm_result['result']}"
-                else:
-                    follow = f"Tool failed: {confirm_result['error']}"
-                self._ai.ask(follow, on_chunk=on_chunk)
+            self._emit({"type": "ai_start"})
+            _, action = self._ai.ask(text, on_chunk=lambda c: self._emit({"type": "ai_chunk", "text": c}))
+            self._emit({"type": "ai_end"})
+            if action:
+                self.propose_action(action["tool"], action.get("args", {}), origin="speech")
         finally:
-            self.state = SessionState.LISTENING
-            self._emit({"type": "state_change", "state": SessionState.LISTENING})
+            self._restore_state()
 
-    def _on_audio_levels(self, levels: list[float]) -> None:
-        self._emit({"type": "audio_levels", "levels": levels})
+    def _restore_state(self) -> None:
+        if not self._running:
+            target = SessionState.IDLE
+        elif self._sleeping:
+            target = SessionState.SLEEPING
+        elif self._paused:
+            target = SessionState.PAUSED
+        elif self._audio.active_sources:
+            target = SessionState.LISTENING
+        else:
+            target = SessionState.ERROR
+        self._set_state(target)
+
+    def _set_state(self, state: str) -> None:
+        self.state = state
+        self._emit({"type": "state_change", "state": state})
+
+    def _asr_problem(self, code: str) -> None:
+        now = time.time()
+        if now - self._asr_notice_at < _ASR_NOTICE_COOLDOWN:
+            return
+        self._asr_notice_at = now
+        if code == LOCAL_MODEL_REQUIRED:
+            message = ("Model ASR lokal belum tersedia. Unduh model Whisper di Setelan. "
+                       "Audio tidak dikirim ke cloud.")
+        else:
+            message = "Transkripsi lokal gagal. Audio tidak dikirim ke cloud."
+        self._emit({"type": "asr_error", "code": code, "message": message})
+
+    def _on_capture_error(self, source: TrackSource, code: str, message: str) -> None:
+        self._emit({"type": "capture_error", "source": source.value, "code": code, "message": message})
+        self._emit_source_states()
+        if self._running and not self._audio.active_sources:
+            self._set_state(SessionState.ERROR)
+
+    def _on_audio_levels(self, source: TrackSource, levels: list[float]) -> None:
+        self._emit({"type": "audio_levels", "source": source.value, "levels": levels})
+
+    def _on_ai_error(self, message: str) -> None:
+        self._emit({"type": "ai_error", "message": message})
 
     def _on_transcript_event(self, evt: dict) -> None:
         self._emit({"type": "transcript_segment", "data": evt})
@@ -283,4 +494,3 @@ class MalvaSession:
             self._on_event(event)
         except Exception as e:
             print(f"[session] emit error: {e}")
-

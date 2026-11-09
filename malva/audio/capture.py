@@ -1,15 +1,17 @@
 """
 malva.audio.capture — Dual-track audio capture service.
 
-Captures microphone and system audio (Stereo Mix / WASAPI loopback)
-as ISOLATED tracks. Never mixes them.
+Microphone and system audio are captured as ISOLATED tracks and never mixed.
 
-Features:
-  - Real-time 5-band spectrum audio level callback for the UI
-  - Multi-sample rate mic fallback (16000, 44100, 48000 Hz)
-  - Pre-speech audio buffer so words are not clipped at start
-  - Resilient VAD with configurable sensitivity
-  - Non-blocking utterance delivery to ASR worker
+Key guarantees (Blueprint §4, §8; audit P0.1–P0.3):
+  * System audio is captured only from a WASAPI loopback endpoint opened via
+    PyAudioWPatch. If that is unavailable, start() raises AudioDeviceError.
+    It never falls back to the microphone / default input.
+  * A track is only reported as active after its stream has actually opened.
+    start() opens the stream synchronously before the capture thread begins.
+  * Levels for the UI are real FFT band energies, tagged with their source.
+  * Stereo loopback is downmixed to mono AFTER reading the real device format.
+  * Pause keeps draining the stream (no stale buffers) and resets the bars.
 """
 
 from __future__ import annotations
@@ -20,30 +22,47 @@ import time
 import uuid
 import wave
 from enum import Enum
-from pathlib import Path
 from typing import Callable
 
 import numpy as np
-import pyaudio
 
-try:
-    import pyaudiowpatch as pyaudio_sys
+try:  # Standard PyAudio: microphone input.
+    import pyaudio
+except ImportError:  # pragma: no cover - only on machines without PyAudio
+    pyaudio = None  # type: ignore[assignment]
+
+try:  # PyAudioWPatch: WASAPI loopback for system audio.
+    import pyaudiowpatch as pyaudio_wp
     _HAS_WPATCH = True
-except ImportError:
-    import pyaudio as pyaudio_sys  # type: ignore
+except ImportError:  # pragma: no cover
+    pyaudio_wp = None  # type: ignore[assignment]
     _HAS_WPATCH = False
 
-CHUNK       = 1024
-FORMAT      = pyaudio.paInt16
-CHANNELS    = 1
-TARGET_RATE = 16000
+from malva.audio.analysis import SpectrumAnalyzer
+from malva.audio.devices import (
+    ERR_DEVICE_LOST,
+    ERR_LOOPBACK_UNAVAILABLE,
+    ERR_OPEN_FAILED,
+    AudioDeviceError,
+    DeviceInfo,
+    find_default_microphone,
+    find_loopback_device,
+)
 
-# VAD parameters (calibrated for laptop microphones)
-SPEECH_THRESHOLD   = 45.0    # RMS trigger threshold (lowered from 65 for better sensitivity)
-SILENCE_THRESHOLD  = 25.0    # RMS silence threshold (lowered from 35)
-SILENCE_DURATION   = 1.1     # Seconds of silence to finalize utterance
+CHUNK        = 1024
+FORMAT       = 8          # paInt16 (PortAudio constant; avoids importing pyaudio)
+TARGET_RATE  = 16000
+
+# VAD parameters (RMS on int16 scale; calibrated for laptop microphones)
+SPEECH_THRESHOLD   = 45.0
+SILENCE_THRESHOLD  = 25.0
+SILENCE_DURATION   = 1.1     # seconds of silence that ends an utterance
 MAX_RECORD_SECONDS = 30.0
-PRE_BUFFER_CHUNKS  = 12      # ~0.4s pre-speech audio buffer
+PRE_BUFFER_CHUNKS  = 12      # ~0.4 s before speech onset
+MIN_SPEECH_SECONDS = 0.3
+
+LEVELS_MIN_INTERVAL = 1.0 / 25.0   # UI update cap: 25 Hz
+MAX_CONSECUTIVE_READ_ERRORS = 25
 
 
 class TrackSource(str, Enum):
@@ -52,169 +71,201 @@ class TrackSource(str, Enum):
 
 
 class TrackState(str, Enum):
-    IDLE     = "idle"
-    ACTIVE   = "active"
-    PAUSED   = "paused"
-    STOPPED  = "stopped"
-    ERROR    = "error"
+    IDLE    = "idle"
+    ACTIVE  = "active"
+    PAUSED  = "paused"
+    STOPPED = "stopped"
+    ERROR   = "error"
 
 
 class AudioTrack:
-    """Single isolated audio source track (mic OR system audio)."""
+    """One isolated audio source (microphone OR system audio)."""
 
     def __init__(
         self,
         source: TrackSource,
         session_id: str,
         on_utterance: Callable[[bytes, "AudioTrack"], None],
-        on_levels: Callable[[list[float]], None] | None = None,
+        on_levels: Callable[["TrackSource", list[float]], None] | None = None,
+        on_error: Callable[["TrackSource", str, str], None] | None = None,
         device_index: int | None = None,
-        device_name: str = "",
     ):
         self.track_id     = uuid.uuid4().hex
         self.source       = source
         self.session_id   = session_id
         self.device_index = device_index
-        self.device_name  = device_name
+        self.device_name  = ""
+        self.sample_rate  = TARGET_RATE
+        self.channels     = 1
         self.state        = TrackState.IDLE
+        self.error_code   = ""
+        self.error_message = ""
         self.started_at: float | None = None
+
         self._on_utterance = on_utterance
-        self._on_levels   = on_levels
+        self._on_levels    = on_levels
+        self._on_error     = on_error
         self._thread: threading.Thread | None = None
-        self._stop_evt    = threading.Event()
-        self._pa: pyaudio.PyAudio | None = None
+        self._stop_evt     = threading.Event()
+        self._pa           = None
+        self._stream       = None
+        self._lock         = threading.Lock()
 
     # ------------------------------------------------------------------ control
-
-    def start(self) -> None:
-        if self.state == TrackState.ACTIVE:
-            return
-        self._stop_evt.clear()
-        self.state = TrackState.ACTIVE
-        self.started_at = time.time()
-        self._thread = threading.Thread(
-            target=self._capture_loop,
-            daemon=True,
-            name=f"track-{self.source.value}",
-        )
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_evt.set()
-        self.state = TrackState.STOPPED
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-
-    def pause(self) -> None:
-        self.state = TrackState.PAUSED
-
-    def resume(self) -> None:
-        if self.state == TrackState.PAUSED:
-            self.state = TrackState.ACTIVE
 
     @property
     def is_active(self) -> bool:
         return self.state == TrackState.ACTIVE
 
+    @property
+    def is_running(self) -> bool:
+        return self.state in (TrackState.ACTIVE, TrackState.PAUSED)
+
+    def start(self) -> None:
+        """Open the device, then start the capture thread. Raises AudioDeviceError."""
+        with self._lock:
+            if self.is_running:
+                return
+            self._open_device()           # raises before any state change
+            self._stop_evt.clear()
+            self.state = TrackState.ACTIVE
+            self.started_at = time.time()
+            self._thread = threading.Thread(
+                target=self._capture_loop, daemon=True, name=f"track-{self.source.value}",
+            )
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        if self._thread and self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=3.0)
+        self._close_device()
+        if self.state != TrackState.ERROR:
+            self.state = TrackState.STOPPED
+
+    def pause(self) -> None:
+        if self.state == TrackState.ACTIVE:
+            self.state = TrackState.PAUSED
+
+    def resume(self) -> None:
+        if self.state == TrackState.PAUSED:
+            self.state = TrackState.ACTIVE
+
+    # ------------------------------------------------------------------ device
+
+    def _open_device(self) -> None:
+        if self.source == TrackSource.MICROPHONE:
+            if pyaudio is None:
+                raise AudioDeviceError(ERR_OPEN_FAILED, "PyAudio belum terpasang; mikrofon tidak bisa dibuka.")
+            pa = pyaudio.PyAudio()
+            try:
+                if self.device_index is None:
+                    dev = find_default_microphone(pa)
+                else:
+                    dev = DeviceInfo.from_pa(pa.get_device_info_by_index(self.device_index))
+                stream, rate, channels = _open_input_stream(pa, dev)
+            except Exception:
+                pa.terminate()
+                raise
+        else:
+            if not _HAS_WPATCH:
+                raise AudioDeviceError(
+                    ERR_LOOPBACK_UNAVAILABLE,
+                    "PyAudioWPatch belum terpasang; audio sistem tidak bisa direkam.",
+                )
+            pa = pyaudio_wp.PyAudio()
+            try:
+                dev = find_loopback_device(pa)
+                stream, rate, channels = _open_input_stream(pa, dev)
+            except Exception:
+                pa.terminate()
+                raise
+
+        self._pa, self._stream = pa, stream
+        self.sample_rate, self.channels = rate, channels
+        self.device_name = dev.name
+        self.device_index = dev.index
+        self.error_code = ""
+        self.error_message = ""
+
+    def _close_device(self) -> None:
+        with self._lock:
+            stream, pa = self._stream, self._pa
+            self._stream, self._pa = None, None
+        if stream is not None:
+            try:
+                stream.stop_stream()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+        if pa is not None:
+            try:
+                pa.terminate()
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------ capture loop
 
-    def _open_stream(self, pa: pyaudio.PyAudio, dev_idx: int | None):
-        """Try opening at 16000, 44100, 48000 Hz for maximum device compatibility."""
-        rates_to_try = (TARGET_RATE, 44100, 48000)
-        for rate in rates_to_try:
-            try:
-                stream = pa.open(
-                    format=FORMAT,
-                    channels=CHANNELS,
-                    rate=rate,
-                    input=True,
-                    input_device_index=dev_idx,
-                    frames_per_buffer=CHUNK,
-                )
-                return stream, rate
-            except Exception:
-                continue
-        return None, TARGET_RATE
-
     def _capture_loop(self) -> None:
-        self._pa = pyaudio.PyAudio()
-        dev_idx = self._resolve_device_index()
-        stream, actual_rate = self._open_stream(self._pa, dev_idx)
-
-        if stream is None:
-            self.state = TrackState.ERROR
-            print(f"[audio/{self.source.value}] Gagal membuka stream mic pada device {dev_idx}")
-            if self._pa:
-                self._pa.terminate()
-            return
-
-        frames: list[bytes] = []
+        analyzer = SpectrumAnalyzer(sample_rate=self.sample_rate)
+        last_levels_at = 0.0
+        was_paused = False
         pre_buffer: list[bytes] = []
+        frames: list[bytes] = []
         speech_started = False
         above_count = 0
         silence_count = 0
-        silence_needed = int(SILENCE_DURATION * actual_rate / CHUNK)
-        min_frames = int(0.3 * actual_rate / CHUNK)
-        chunk_idx = 0
+        silence_needed = max(1, int(SILENCE_DURATION * self.sample_rate / CHUNK))
+        min_frames = max(1, int(MIN_SPEECH_SECONDS * self.sample_rate / CHUNK))
         record_start = 0.0
+        read_errors = 0
 
         try:
             while not self._stop_evt.is_set():
-                if self.state == TrackState.PAUSED:
-                    time.sleep(0.08)
-                    continue
+                stream = self._stream
+                if stream is None:
+                    break
 
                 try:
-                    data = stream.read(CHUNK, exception_on_overflow=False)
-                except Exception:
+                    raw = stream.read(CHUNK, exception_on_overflow=False)
+                    read_errors = 0
+                except Exception as e:
+                    read_errors += 1
+                    if read_errors >= MAX_CONSECUTIVE_READ_ERRORS:
+                        self._fail(ERR_DEVICE_LOST, f"Perangkat '{self.device_name}' terputus: {e}")
+                        break
+                    time.sleep(0.02)
                     continue
 
-                arr = np.frombuffer(data, dtype=np.int16).astype(np.float32)
-                rms = float(np.sqrt(np.mean(arr ** 2))) if arr.size else 0.0
-                chunk_idx += 1
-                
-                # Debug: print RMS every 50 chunks to monitor audio levels
-                if chunk_idx % 50 == 0:
-                    print(f"[audio/{self.source.value}] RMS: {rms:.1f}")
+                if self.state == TrackState.PAUSED:
+                    if not was_paused:
+                        was_paused = True
+                        pre_buffer.clear()
+                        frames.clear()
+                        speech_started = False
+                        self._emit_levels(analyzer.reset(), force=True)
+                    continue
+                was_paused = False
 
-                # Send 5-bar spectrum levels to UI (both mic and system audio)
-                if self._on_levels:
-                    if len(arr) >= 64:
-                        # FFT-based frequency bands (5 bands: sub, low, mid, high, ultra)
-                        fft = np.fft.rfft(arr * np.hanning(len(arr)))
-                        magnitudes = np.abs(fft)
-                        band_size = len(magnitudes) // 5
-                        levels = []
-                        for i in range(5):
-                            start = i * band_size
-                            end = (i + 1) * band_size if i < 4 else len(magnitudes)
-                            band = magnitudes[start:end]
-                            if len(band) == 0:
-                                levels.append(6.0)
-                                continue
-                            avg = float(np.mean(band))
-                            lvl = min(32.0, 6.0 + np.sqrt(avg) * 2.2)
-                            levels.append(round(lvl, 1))
-                    else:
-                        # Fallback to RMS slices
-                        seg = max(1, len(arr) // 5)
-                        levels = []
-                        for i in range(5):
-                            ch = arr[i * seg:(i + 1) * seg]
-                            if len(ch) == 0:
-                                levels.append(6.0)
-                                continue
-                            r = float(np.sqrt(np.mean(ch ** 2)))
-                            lvl = min(32.0, 6.0 + np.sqrt(r) * 2.2)
-                            levels.append(round(lvl, 1))
-                    self._on_levels(levels)
+                mono = _to_mono_int16(raw, self.channels)
+                if mono.size == 0:
+                    continue
+                rms = float(np.sqrt(np.mean(mono ** 2)))
 
-                # VAD State Machine
+                now = time.time()
+                if self._on_levels and now - last_levels_at >= LEVELS_MIN_INTERVAL:
+                    last_levels_at = now
+                    self._emit_levels(analyzer.process(mono))
+
+                mono_bytes = mono.astype(np.int16).tobytes()
+
                 if not speech_started:
-                    pre_buffer.append(data)
+                    pre_buffer.append(mono_bytes)
                     if len(pre_buffer) > PRE_BUFFER_CHUNKS:
                         pre_buffer.pop(0)
-
                     if rms > SPEECH_THRESHOLD:
                         above_count += 1
                         if above_count >= 2:
@@ -224,130 +275,117 @@ class AudioTrack:
                             record_start = time.time()
                             above_count = 0
                             silence_count = 0
-                            print(f"[audio/{self.source.value}] Speech detected! RMS: {rms:.1f}")
                     else:
                         above_count = 0
+                    continue
+
+                frames.append(mono_bytes)
+                elapsed = time.time() - record_start
+                if rms < SILENCE_THRESHOLD:
+                    silence_count += 1
                 else:
-                    frames.append(data)
-                    elapsed = time.time() - record_start
+                    silence_count = 0
 
-                    if rms < SILENCE_THRESHOLD:
-                        silence_count += 1
-                        if silence_count >= silence_needed or elapsed >= MAX_RECORD_SECONDS:
-                            if len(frames) >= min_frames:
-                                print(f"[audio/{self.source.value}] Utterance complete: {elapsed:.1f}s, {len(frames)} frames")
-                                wav_bytes = self._frames_to_wav(frames, actual_rate)
-                                threading.Thread(
-                                    target=self._on_utterance,
-                                    args=(wav_bytes, self),
-                                    daemon=True,
-                                ).start()
-                            frames.clear()
-                            speech_started = False
-                            silence_count = 0
-                    else:
-                        silence_count = 0
-                        if elapsed >= MAX_RECORD_SECONDS:
-                            if len(frames) >= min_frames:
-                                wav_bytes = self._frames_to_wav(frames, actual_rate)
-                                threading.Thread(
-                                    target=self._on_utterance,
-                                    args=(wav_bytes, self),
-                                    daemon=True,
-                                ).start()
-                            frames.clear()
-                            speech_started = False
-                            silence_count = 0
+                if silence_count >= silence_needed or elapsed >= MAX_RECORD_SECONDS:
+                    if len(frames) >= min_frames:
+                        wav_bytes = self._frames_to_wav(frames, self.sample_rate)
+                        threading.Thread(
+                            target=self._on_utterance, args=(wav_bytes, self), daemon=True,
+                        ).start()
+                    frames = []
+                    speech_started = False
+                    silence_count = 0
         finally:
-            try:
-                stream.stop_stream()
-                stream.close()
-            except Exception:
-                pass
-            if self._pa:
-                try:
-                    self._pa.terminate()
-                except Exception:
-                    pass
+            self._close_device()
 
-    def _resolve_device_index(self) -> int | None:
-        if self.device_index is not None:
-            return self.device_index
-        if self.source == TrackSource.SYSTEM_AUDIO:
-            return self._find_system_audio_device()
-        return None  # Default input for microphone
-
-    def _find_system_audio_device(self) -> int | None:
-        """Find WASAPI loopback device via pyaudiowpatch."""
-        if not _HAS_WPATCH:
-            print(f"[audio/{self.source.value}] pyaudiowpatch not available")
-            return None
-            
-        try:
-            import pyaudiowpatch as pa_wp
-            pa_local = pa_wp.PyAudio()
+    def _emit_levels(self, levels: list[float], force: bool = False) -> None:
+        if self._on_levels:
             try:
-                # Get default output device for loopback
-                default_output = pa_local.get_default_output_device_info()
-                loopback_info = pa_local.get_loopback_device_info(default_output["index"])
-                self.device_name = loopback_info["name"]
-                device_idx = loopback_info["index"]
-                pa_local.terminate()
-                print(f"[audio/{self.source.value}] Found WASAPI loopback: {self.device_name} (device {device_idx})")
-                return device_idx
+                self._on_levels(self.source, levels)
             except Exception as e:
-                print(f"[audio/{self.source.value}] get_loopback_device_info failed: {e}")
-                pa_local.terminate()
-                
-                # Fallback to legacy name search
-                pa_legacy = pyaudio.PyAudio()
-                count = pa_legacy.get_device_count()
-                print(f"[audio/{self.source.value}] Searching {count} devices for Stereo Mix/Loopback...")
-                for i in range(count):
-                    try:
-                        info = pa_legacy.get_device_info_by_index(i)
-                        name: str = info.get("name", "").lower()
-                        max_in = info.get("maxInputChannels", 0)
-                        if max_in > 0 and ("stereo mix" in name or "loopback" in name):
-                            self.device_name = info.get("name", "Stereo Mix")
-                            pa_legacy.terminate()
-                            print(f"[audio/{self.source.value}] Found via name search: {self.device_name} (device {i})")
-                            return i
-                    except Exception:
-                        continue
-                pa_legacy.terminate()
-                print(f"[audio/{self.source.value}] No system audio device found")
-                return None
-        except Exception as e:
-            print(f"[audio/{self.source.value}] System audio detection error: {e}")
-            return None
+                print(f"[audio/{self.source.value}] levels callback error: {e}")
 
-    def _frames_to_wav(self, frames: list[bytes], sample_rate: int) -> bytes:
-        """Convert raw PCM frames to WAV bytes (resampled to 16 kHz if necessary)."""
+    def _fail(self, code: str, message: str) -> None:
+        self.state = TrackState.ERROR
+        self.error_code = code
+        self.error_message = message
+        print(f"[audio/{self.source.value}] {code}: {message}")
+        if self._on_error:
+            try:
+                self._on_error(self.source, code, message)
+            except Exception as e:
+                print(f"[audio/{self.source.value}] error callback failed: {e}")
+
+    # ------------------------------------------------------------------ encoding
+
+    @staticmethod
+    def _frames_to_wav(frames: list[bytes], sample_rate: int) -> bytes:
+        """Mono int16 PCM → WAV (resampled to 16 kHz when scipy is available)."""
         raw_pcm = b"".join(frames)
         if sample_rate != TARGET_RATE:
             try:
                 import scipy.signal as sg
                 arr = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32)
-                resampled = sg.resample_poly(arr, TARGET_RATE, sample_rate).astype(np.int16)
-                raw_pcm = resampled.tobytes()
+                raw_pcm = sg.resample_poly(arr, TARGET_RATE, sample_rate).astype(np.int16).tobytes()
                 sample_rate = TARGET_RATE
             except Exception:
                 pass
-
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
-            wf.setnchannels(CHANNELS)
+            wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(sample_rate)
             wf.writeframes(raw_pcm)
         return buf.getvalue()
 
 
+# ------------------------------------------------------------------ helpers
+
+def _open_input_stream(pa, dev: DeviceInfo):
+    """Open an input stream on `dev`, trying the device's own rate first."""
+    rates: list[int] = []
+    for r in (int(dev.default_sample_rate or 0), TARGET_RATE, 44100, 48000):
+        if r and r not in rates:
+            rates.append(r)
+    channel_options: list[int] = [1]
+    if dev.max_input_channels >= 2:
+        channel_options = [min(dev.max_input_channels, 2), 1]
+
+    last_error: Exception | None = None
+    for ch in channel_options:
+        for rate in rates:
+            try:
+                stream = pa.open(
+                    format=FORMAT,
+                    channels=ch,
+                    rate=rate,
+                    input=True,
+                    input_device_index=dev.index,
+                    frames_per_buffer=CHUNK,
+                )
+                return stream, rate, ch
+            except Exception as e:
+                last_error = e
+    raise AudioDeviceError(
+        ERR_OPEN_FAILED,
+        f"Tidak bisa membuka '{dev.name}' (device {dev.index}): {last_error}",
+    )
+
+
+def _to_mono_int16(raw: bytes, channels: int) -> np.ndarray:
+    arr = np.frombuffer(raw, dtype=np.int16)
+    if channels > 1 and arr.size >= channels:
+        arr = arr[: arr.size - (arr.size % channels)].reshape(-1, channels)
+        arr = arr.astype(np.float32).mean(axis=1)
+    else:
+        arr = arr.astype(np.float32)
+    return arr
+
+
 class AudioEngine:
     """
-    Manages multiple named AudioTracks for a session.
-    Enforces audio-source invariants from Blueprint §4 and §8.
+    Owns the named tracks for one session and enforces source invariants
+    (Blueprint §4): Voice Input may never receive system audio.
     """
 
     def __init__(
@@ -355,17 +393,20 @@ class AudioEngine:
         session_id: str,
         mode: str,
         on_utterance: Callable[[bytes, TrackSource, str], None],
-        on_levels: Callable[[list[float]], None] | None = None,
-        db = None,
+        on_levels: Callable[[TrackSource, list[float]], None] | None = None,
+        on_error: Callable[[TrackSource, str, str], None] | None = None,
+        db=None,
     ):
         self.session_id    = session_id
         self.mode          = mode
         self._on_utterance = on_utterance
         self._on_levels    = on_levels
+        self._on_error     = on_error
         self._db           = db
         self._tracks: dict[TrackSource, AudioTrack] = {}
+        self._lock = threading.Lock()
 
-    def set_levels_callback(self, fn: Callable[[list[float]], None] | None) -> None:
+    def set_levels_callback(self, fn) -> None:
         self._on_levels = fn
         for track in self._tracks.values():
             track._on_levels = fn
@@ -375,37 +416,46 @@ class AudioEngine:
 
     def start_system_audio(self, device_index: int | None = None) -> AudioTrack:
         if self.mode == "voice_input":
-            raise ValueError("Voice Input mode must not receive system audio (Blueprint §4).")
+            raise ValueError("Voice Input tidak boleh menerima audio sistem (Blueprint §4).")
         return self._start_track(TrackSource.SYSTEM_AUDIO, device_index)
 
     def stop_all(self) -> None:
-        for track in list(self._tracks.values()):
+        with self._lock:
+            tracks = list(self._tracks.values())
+            self._tracks.clear()
+        for track in tracks:
             track.stop()
-        self._tracks.clear()
 
     def stop_track(self, source: TrackSource) -> None:
-        t = self._tracks.pop(source, None)
-        if t:
-            t.stop()
+        with self._lock:
+            track = self._tracks.pop(source, None)
+        if track:
+            track.stop()
 
     def pause_all(self) -> None:
-        for t in self._tracks.values():
+        for t in list(self._tracks.values()):
             t.pause()
 
     def resume_all(self) -> None:
-        for t in self._tracks.values():
+        for t in list(self._tracks.values()):
             t.resume()
 
     @property
     def active_sources(self) -> list[TrackSource]:
-        return [src for src, t in self._tracks.items() if t.is_active]
+        """Sources whose stream is open (active or paused). Errored tracks are excluded."""
+        return [src for src, t in list(self._tracks.items()) if t.is_running]
+
+    def source_states(self) -> dict[str, str]:
+        return {src.value: t.state.value for src, t in list(self._tracks.items())}
 
     def get_track(self, source: TrackSource) -> AudioTrack | None:
         return self._tracks.get(source)
 
     def _start_track(self, source: TrackSource, device_index: int | None) -> AudioTrack:
-        if source in self._tracks:
-            self._tracks[source].stop()
+        with self._lock:
+            existing = self._tracks.get(source)
+            if existing is not None and existing.is_running:
+                return existing  # never create a duplicate stream
 
         def on_track_utterance(wav_bytes: bytes, track: AudioTrack) -> None:
             self._on_utterance(wav_bytes, track.source, self.session_id)
@@ -415,9 +465,11 @@ class AudioEngine:
             session_id=self.session_id,
             on_utterance=on_track_utterance,
             on_levels=self._on_levels,
+            on_error=self._on_error,
             device_index=device_index,
         )
-        # Register before capture starts; an utterance can finish on another thread.
+        track.start()  # raises AudioDeviceError; nothing registered on failure
+
         if self._db:
             try:
                 self._db.create_audio_track(
@@ -425,11 +477,15 @@ class AudioEngine:
                     session_id=self.session_id,
                     source_type=source.value,
                     device_name=track.device_name or "Unknown",
-                    sample_rate=16000,
+                    sample_rate=track.sample_rate,
                     channels=1,
                 )
             except Exception as e:
                 print(f"[audio] Failed to register track: {e}")
-        self._tracks[source] = track
-        track.start()
+
+        with self._lock:
+            old = self._tracks.get(source)
+            self._tracks[source] = track
+        if old is not None and old is not track:
+            old.stop()
         return track

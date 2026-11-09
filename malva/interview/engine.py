@@ -79,6 +79,9 @@ class InterviewEngine:
             "Hanya pertanyaannya saja, tanpa penjelasan tambahan."
         )
         question, _ = self._ai.ask(prompt, on_chunk=on_chunk)
+        question = (question or "").strip()
+        if not question:
+            return ""  # AI unavailable: do not record an empty question
         self._practice.questions_asked.append(question)
         if self._on_update:
             self._on_update({"type": "interview_question", "data": {"question": question}})
@@ -184,6 +187,8 @@ class InterviewEngine:
             return {"report_type": "notes", "summary": "Tidak ada transkrip."}
 
         summary    = self._ai.summarize_transcript(transcript_text, task="interview_notes")
+        if not summary.strip():
+            summary = "(Ringkasan AI tidak tersedia. Pastikan AI lokal berjalan.)"
         follow_ups = self._generate_follow_ups(transcript_text)
 
         report = {
