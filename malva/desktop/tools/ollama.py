@@ -18,7 +18,7 @@ load_dotenv()
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
 
 # Web search/fetch hanya ada di API native Ollama (bukan endpoint OpenAI-compatible).
-OLLAMA_HOST = (os.getenv("OLLAMA_HOST") or "https://ollama.com").rstrip("/")
+OLLAMA_HOST = (os.getenv("OLLAMA_HOST") or "https://ollama.com").rstrip("/")  # cloud; see set_cloud_gate
 
 HEADERS = {"Content-Type": "application/json"}
 if OLLAMA_API_KEY:
@@ -187,11 +187,31 @@ def _fetch_html(url: str) -> dict:
 # --------------------------------------------------------------------- web tools
 
 
+# The app wires this to PrivacyManager.cloud_processing. Until then it fails closed.
+_cloud_allowed = lambda: False
+
+
+def set_cloud_gate(fn) -> None:
+    """Connect web search to the cloud opt-in. Any query sent out is third-party processing."""
+    global _cloud_allowed
+    _cloud_allowed = fn
+
+
+def _require_cloud(what: str) -> None:
+    try:
+        allowed = bool(_cloud_allowed())
+    except Exception:
+        allowed = False
+    if not allowed:
+        raise WebError(f"{what} memakai layanan cloud. Aktifkan 'Izinkan cloud' di tab Setelan.")
+
+
 def web_search(query: str, max_results: int = 5) -> dict:
-    """Cari di web. Prioritas API Ollama, fallback DuckDuckGo.
+    """Cari di web. Prioritas API Ollama, fallback DuckDuckGo. Hanya dengan opt-in cloud.
 
     Return: {"query", "source", "results": [{"title","url","content"}]}
     """
+    _require_cloud("Pencarian web")
     q = str(query or "").strip()
     if not q:
         raise WebError("query kosong")

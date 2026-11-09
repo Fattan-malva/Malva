@@ -76,9 +76,18 @@ class PrivacyManager:
         """Google STT (or any cloud speech API) may be used only with explicit opt-in."""
         return self.cloud_processing
 
+    def allows_llm(self) -> bool:
+        """The LLM is always a cloud service (Ollama endpoint from OLLAMA_URL).
+
+        There is no local LLM in Malva. Local speech recognition (faster-whisper) is
+        the only on-device model. So every chat, summary, and feedback request needs
+        the explicit cloud opt-in, whatever host the URL points to.
+        """
+        return self.cloud_processing
+
     def allows_remote_endpoint(self, url: str) -> bool:
-        """LLM endpoints: localhost is always fine; remote needs explicit opt-in."""
-        return (not is_remote_endpoint(url)) or self.cloud_processing
+        """Kept for callers that pass a URL. The URL does not change the answer: the LLM is cloud."""
+        return self.allows_llm()
 
     def set_cloud_processing(self, enabled: bool) -> None:
         """Explicit user action only. Persisted so the choice survives restarts."""

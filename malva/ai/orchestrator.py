@@ -23,10 +23,10 @@ from typing import Callable, Iterator
 
 import httpx
 
-from malva.privacy.manager import is_remote_endpoint
 from malva.storage.db import Database
 
-OLLAMA_URL   = os.getenv("OLLAMA_URL",   "http://localhost:11434/v1/chat/completions")
+# Ollama cloud endpoint. Malva has no local LLM: this URL is always treated as cloud.
+OLLAMA_URL   = os.getenv("OLLAMA_URL", "")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:31b-cloud")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
 
@@ -194,21 +194,16 @@ class AIOrchestrator:
     # ------------------------------------------------------------------ policy
 
     def _endpoint_allowed(self) -> bool:
-        """Every LLM request goes through here. Fail closed."""
-        url = OLLAMA_URL.strip()
-        if not url:
-            self._report_error("Endpoint AI belum diatur (OLLAMA_URL kosong).")
+        """Every LLM request goes through here. The LLM is Ollama cloud only; fail closed."""
+        if not OLLAMA_URL.strip():
+            self._report_error("AI belum diatur. Isi OLLAMA_URL di file .env (endpoint Ollama cloud).")
             return False
-        if self._privacy is None:
-            allowed = not is_remote_endpoint(url)
-        else:
-            allowed = self._privacy.allows_remote_endpoint(url)
-        if not allowed:
+        if self._privacy is None or not self._privacy.allows_llm():
             self._report_error(
-                "AI lokal belum berjalan. Jalankan Ollama di komputer ini, "
-                "atau aktifkan cloud secara eksplisit di Setelan."
+                "AI memakai Ollama cloud. Aktifkan 'Izinkan cloud' di tab Setelan untuk memakainya."
             )
-        return allowed
+            return False
+        return True
 
     def _report_error(self, message: str) -> None:
         print(f"[ai] {message}")

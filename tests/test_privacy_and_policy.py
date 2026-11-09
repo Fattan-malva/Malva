@@ -64,8 +64,11 @@ def test_opt_in_can_be_revoked():
     assert PrivacyManager(db=db).local_only is True
 
 
-def test_localhost_llm_always_allowed_without_cloud():
+def test_localhost_llm_is_still_cloud_without_opt_in():
     pm = PrivacyManager(db=FakeDB())
+    # Malva has no local LLM: even a localhost URL is the Ollama cloud path and needs the opt-in.
+    assert pm.allows_remote_endpoint("http://localhost:11434/v1") is False
+    pm.set_cloud_processing(True)
     assert pm.allows_remote_endpoint("http://localhost:11434/v1") is True
 
 
@@ -171,7 +174,7 @@ def test_llm_remote_endpoint_blocked_in_local_only(monkeypatch):
     text, action = ai.ask("halo")
     assert RecordingClient.calls == [], "no HTTP request may be made"
     assert text == "" and action is None
-    assert errors and "AI lokal belum berjalan" in errors[0]
+    assert errors and "Ollama cloud" in errors[0]
 
 
 def test_llm_remote_endpoint_allowed_after_opt_in(monkeypatch):
@@ -235,3 +238,35 @@ def test_already_sleeping_or_paused_is_not_retriggered():
 ])
 def test_sleep_seconds_parsing(raw, expected):
     assert parse_sleep_seconds(raw) == expected
+
+
+def test_web_search_is_blocked_without_cloud_opt_in(monkeypatch):
+    """Queries sent to Ollama or DuckDuckGo are third-party processing: opt-in only."""
+    from malva.desktop.tools import ollama as web_backend
+
+    class NoHttp:
+        def __init__(self, *a, **k):
+            raise AssertionError("no HTTP request may be made without opt-in")
+
+    monkeypatch.setattr(web_backend.httpx, "Client", NoHttp)
+    web_backend.set_cloud_gate(lambda: False)
+    try:
+        import pytest
+        with pytest.raises(web_backend.WebError, match="Izinkan cloud"):
+            web_backend.web_search("berita hari ini")
+    finally:
+        web_backend.set_cloud_gate(lambda: False)
+
+
+def test_web_search_allowed_after_opt_in_reaches_backend(monkeypatch):
+    from malva.desktop.tools import ollama as web_backend
+
+    seen = []
+    monkeypatch.setattr(web_backend, "_post_native", lambda path, payload, timeout=None: seen.append(path) or {"results": []})
+    monkeypatch.setattr(web_backend, "_ddg_search", lambda q, n: [{"title": "t", "url": "https://x", "content": "c"}])
+    web_backend.set_cloud_gate(lambda: True)
+    try:
+        out = web_backend.web_search("halo")
+    finally:
+        web_backend.set_cloud_gate(lambda: False)
+    assert seen == ["/api/web_search"] and out["results"]

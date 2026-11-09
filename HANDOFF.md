@@ -28,7 +28,9 @@ Aturan dasar: audio sistem **tidak pernah** diam-diam dialihkan ke mikrofon. Jik
 
 - Default **lokal saja**. Cloud diaktifkan hanya lewat tombol "Izinkan cloud" di tab Setelan, disimpan di tabel `app_settings` (kunci `cloud_processing`), dan bisa dicabut.
 - Variabel lingkungan atau URL tidak dianggap persetujuan.
-- Google STT hanya dipakai setelah opt-in. Endpoint LLM non-localhost juga hanya dipakai setelah opt-in. Jika model lokal gagal, sistem **tidak** fallback ke cloud; pengguna diberi pesan.
+- **Tidak ada LLM lokal.** Satu-satunya model lokal adalah Whisper (faster-whisper) untuk ASR. Semua AI (chat, ringkasan, feedback) memakai Ollama cloud dari `OLLAMA_URL`, dan itu selalu dianggap cloud, termasuk jika URL-nya localhost. Pencarian web (Ollama, lalu DuckDuckGo) juga hanya jalan setelah opt-in.
+- Google STT hanya dipakai setelah opt-in. Jika model Whisper lokal gagal, sistem **tidak** fallback ke cloud; pengguna diberi pesan.
+- Partial (teks live) selalu lokal. Tidak pernah dikirim ke cloud dan tidak disimpan. Hanya hasil final yang masuk transkrip.
 - Hidden Mode memakai `SetWindowDisplayAffinity` (WDA_EXCLUDEFROMCAPTURE). Ini **bukan** jaminan tidak terlihat. Status yang ditampilkan jujur: `disabled`, `active`, `unsupported` (Windows terlalu lama), `failed`.
 
 ## 4. Kontrak event (sumber kebenaran: `EVENT_TYPES` di `malva/shell/session.py`)
@@ -93,6 +95,18 @@ Daftar QA manual lengkap ada di `Malva_Repository_Audit_and_Agent_Prompt_v2.md`.
 ## 10. Konfigurasi
 
 - Salin `.env.example` menjadi `.env`. Default-nya lokal saja.
-- Isi `OLLAMA_MODEL` dengan model yang sudah ditarik secara lokal.
+- `OLLAMA_URL` adalah endpoint Ollama cloud. Isi API key di `OLLAMA_API_KEY`. Aktifkan "Izinkan cloud" di Setelan agar AI berjalan.
 - `SLEEP_AFTER_SECONDS=60`; isi `0` untuk menonaktifkan auto-sleep.
 - Jalankan di Windows: `pip install -r requirements.txt` lalu `python app.py`.
+
+## 11. Log dan diagnosa crash
+
+- Lokasi: `%LOCALAPPDATA%\Malva\logs\malva.log` (log aplikasi, exception dari semua thread) dan `crash.log` (crash native seperti access violation, lewat `faulthandler`).
+- Jika aplikasi mati sendiri, kirim kedua file itu. Tanpa `crash.log`, crash native tidak meninggalkan jejak apa pun.
+- Log tidak berisi transkrip atau audio.
+
+## 12. Perubahan terbaru (2026-11-09)
+
+- **Drag window**: sebelumnya `PostMessage(SC_MOVE)` dan tidak pernah menggerakkan window. Sekarang memakai mekanisme drag pywebview 6.2.1: `easy_drag=False` dan statusbar bertanda `pywebview-drag-region`. Belum diuji di Windows.
+- **Teks live**: transkripsi sebelumnya baru jalan setelah 1,1 detik hening (atau 30 detik). Sekarang snapshot ucapan dikirim tiap ~1 detik ke Whisper lokal, dan hasilnya muncul sebagai `transcript_partial` di Chat dan Transkrip. Hasil final menggantikannya. Teks live hanya tampil saat panel terbuka; saat pill mengecil belum tampil.
+- **Tanpa LLM lokal**: lihat §3.

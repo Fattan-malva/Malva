@@ -767,6 +767,20 @@ details.transcript-full pre { white-space: pre-wrap; font-family: 'JetBrains Mon
 .privacy-status strong { color: var(--text-primary); }
 .privacy-warning { color: #fcd34d; }
 .seg-text { color: #f1f5f9; line-height: 1.4; }
+.pywebview-drag-region { cursor: move; }
+.live-line {
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+  font-style: italic;
+  padding: 6px 8px;
+  margin-bottom: 8px;
+  border-left: 2px solid #22c55e;
+  background: var(--bg-card);
+  border-radius: 0 5px 5px 0;
+  word-break: break-word;
+}
+.live-line[hidden] { display: none; }
 </style>
 </head>
 <body>
@@ -774,13 +788,13 @@ details.transcript-full pre { white-space: pre-wrap; font-family: 'JetBrains Mon
 <div id="pill" class="compact">
 
   <!-- SLEEP WIDGET (175px solid black strip) -->
-  <div id="sleepViewport" title="Klik untuk membangunkan Malva" onclick="window._wake()">
+  <div id="sleepViewport" class="pywebview-drag-region" title="Klik untuk membangunkan Malva. Seret untuk memindahkan." onclick="window._wake()">
     <svg class="moon-icon" viewBox="0 0 24 24"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
     <span style="font-size:11px;font-weight:500;color:var(--text-muted)">Malva Tertidur</span>
   </div>
 
   <!-- STATUSBAR -->
-  <div id="statusbar">
+  <div id="statusbar" class="pywebview-drag-region">
     <div class="drag-grip" id="dragGrip" title="Seret untuk memindahkan">
       <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M5 9h14M5 15h14"/></svg>
     </div>
@@ -866,6 +880,7 @@ details.transcript-full pre { white-space: pre-wrap; font-family: 'JetBrains Mon
           <svg class="spinner" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
           <span id="spinnerLabel">Memproses…</span>
         </div>
+        <div id="liveLine" class="live-line" hidden></div>
         <div id="pendingArea"></div>
         <div id="voiceArea"></div>
         <div id="answerArea"></div>
@@ -873,6 +888,7 @@ details.transcript-full pre { white-space: pre-wrap; font-family: 'JetBrains Mon
 
       <!-- TRANSKRIP -->
       <div id="viewTranscript" style="display:none">
+        <div id="liveLineT" class="live-line" hidden></div>
         <div id="transcriptList" data-empty="1">
           <div class="muted" style="text-align:center;padding:24px 0">Belum ada transkrip pada sesi ini.</div>
         </div>
@@ -1488,6 +1504,26 @@ window.showVoiceText = function(text) {
 // ==========================================================================
 // TRANSCRIPT
 // ==========================================================================
+// Live text: one line per panel, replaced on every update, cleared when the final
+// segment for that source is ingested (the backend sends an empty text).
+window.showPartialTranscript = function(source, text) {
+  const t = String(text || '');
+  const label = source === 'system_audio' ? 'SYS' : (source === 'microphone' ? 'MIC' : '');
+  document.querySelectorAll('.live-line').forEach((el) => {
+    el.textContent = '';
+    if (t) {
+      if (label) {
+        const tag = document.createElement('span');
+        tag.className = 'meta-tag';
+        tag.textContent = label;
+        el.append(tag, ' ');
+      }
+      el.append(document.createTextNode(t));
+    }
+    el.hidden = !t;
+  });
+};
+
 window.addTranscriptSegment = function(seg) {
   if (!seg || !seg.text) return;
   if (transcriptList.dataset.empty === '1') {
@@ -1773,10 +1809,6 @@ window.addEventListener('load', () => {
   sendReady();
 });
 
-$('dragGrip').addEventListener('mousedown', (e) => {
-  e.preventDefault();
-  call('start_drag');
-});
 </script>
 </body>
 </html>

@@ -64,6 +64,11 @@ MIN_SPEECH_SECONDS = 0.3
 LEVELS_MIN_INTERVAL = 1.0 / 25.0   # UI update cap: 25 Hz
 MAX_CONSECUTIVE_READ_ERRORS = 25
 
+# Live (partial) text: a snapshot of the utterance so far is handed to the session
+# every PARTIAL_INTERVAL_SECONDS once PARTIAL_MIN_SECONDS of speech exists.
+PARTIAL_INTERVAL_SECONDS = 1.0
+PARTIAL_MIN_SECONDS      = 0.8
+
 
 class TrackSource(str, Enum):
     MICROPHONE   = "microphone"
@@ -89,6 +94,7 @@ class AudioTrack:
         on_levels: Callable[["TrackSource", list[float]], None] | None = None,
         on_error: Callable[["TrackSource", str, str], None] | None = None,
         device_index: int | None = None,
+        on_partial: Callable[[bytes, "AudioTrack"], None] | None = None,
     ):
         self.track_id     = uuid.uuid4().hex
         self.source       = source
@@ -105,6 +111,7 @@ class AudioTrack:
         self._on_utterance = on_utterance
         self._on_levels    = on_levels
         self._on_error     = on_error
+        self._on_partial  = on_partial
         self._thread: threading.Thread | None = None
         self._stop_evt     = threading.Event()
         self._pa           = None
@@ -222,6 +229,7 @@ class AudioTrack:
         min_frames = max(1, int(MIN_SPEECH_SECONDS * self.sample_rate / CHUNK))
         record_start = 0.0
         read_errors = 0
+        last_partial_at = 0.0
 
         try:
             while not self._stop_evt.is_set():
@@ -273,6 +281,7 @@ class AudioTrack:
                             frames = list(pre_buffer)
                             pre_buffer.clear()
                             record_start = time.time()
+                            last_partial_at = record_start
                             above_count = 0
                             silence_count = 0
                     else:
@@ -280,6 +289,12 @@ class AudioTrack:
                     continue
 
                 frames.append(mono_bytes)
+                if self._on_partial is not None:
+                    now_p = time.time()
+                    if (now_p - last_partial_at >= PARTIAL_INTERVAL_SECONDS
+                            and len(frames) * CHUNK >= PARTIAL_MIN_SECONDS * self.sample_rate):
+                        last_partial_at = now_p
+                        self._emit_partial(frames)
                 elapsed = time.time() - record_start
                 if rms < SILENCE_THRESHOLD:
                     silence_count += 1
@@ -297,6 +312,14 @@ class AudioTrack:
                     silence_count = 0
         finally:
             self._close_device()
+
+    def _emit_partial(self, frames: list[bytes]) -> None:
+        """Hand a snapshot of the speech so far to the session. Never raises into the capture loop."""
+        try:
+            wav = self._frames_to_wav(list(frames), self.sample_rate)
+            self._on_partial(wav, self)
+        except Exception as e:
+            print(f"[audio] partial hand-off failed: {e}")
 
     def _emit_levels(self, levels: list[float], force: bool = False) -> None:
         if self._on_levels:
@@ -396,10 +419,12 @@ class AudioEngine:
         on_levels: Callable[[TrackSource, list[float]], None] | None = None,
         on_error: Callable[[TrackSource, str, str], None] | None = None,
         db=None,
+        on_partial: Callable[[bytes, TrackSource, str], None] | None = None,
     ):
         self.session_id    = session_id
         self.mode          = mode
         self._on_utterance = on_utterance
+        self._on_partial   = on_partial
         self._on_levels    = on_levels
         self._on_error     = on_error
         self._db           = db
@@ -460,6 +485,10 @@ class AudioEngine:
         def on_track_utterance(wav_bytes: bytes, track: AudioTrack) -> None:
             self._on_utterance(wav_bytes, track.source, self.session_id)
 
+        def on_track_partial(wav_bytes: bytes, track: AudioTrack) -> None:
+            if self._on_partial is not None:
+                self._on_partial(wav_bytes, track.source, self.session_id)
+
         track = AudioTrack(
             source=source,
             session_id=self.session_id,
@@ -467,6 +496,7 @@ class AudioEngine:
             on_levels=self._on_levels,
             on_error=self._on_error,
             device_index=device_index,
+            on_partial=on_track_partial,
         )
         track.start()  # raises AudioDeviceError; nothing registered on failure
 

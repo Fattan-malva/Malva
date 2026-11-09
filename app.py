@@ -39,6 +39,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from malva.diagnostics import setup as _setup_diagnostics  # noqa: E402
+from malva.desktop.tools import ollama as _web_backend  # noqa: E402
+LOG_PATH = _setup_diagnostics()
+
 import webview
 
 from malva.asr.router import ASRRouter
@@ -86,8 +90,6 @@ class MalvaAPI:
     def set_panel_state(self, state: str) -> None:
         self._app.set_panel_state(state)
 
-    def start_drag(self) -> None:
-        self._app.start_drag()
 
     # --- capture controls
     def pause_session(self) -> None:
@@ -188,6 +190,7 @@ class MalvaApp:
         self.database = db.get_db()
 
         self.privacy = PrivacyManager(on_status_change=self._on_privacy_status, db=self.database)
+        _web_backend.set_cloud_gate(lambda: self.privacy.cloud_processing)
 
         tools_enabled = os.getenv("TOOLS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
         self.desktop = DesktopGateway(session_id="", db=self.database, tools_enabled=tools_enabled)
@@ -232,19 +235,6 @@ class MalvaApp:
                 self.window.resize(WIN_W_COMPACT, WIN_H_COMPACT)
         except Exception as e:
             print(f"[window] resize failed: {e}")
-
-    def start_drag(self) -> None:
-        """Native move via Win32. Errors are logged, never silently dropped."""
-        hwnd = self.get_hwnd()
-        if not hwnd:
-            print("[drag] no window handle; drag unavailable")
-            return
-        try:
-            user32 = ctypes.windll.user32
-            user32.PostMessageW(hwnd, 0x0112, 0xF012, 0)  # WM_SYSCOMMAND + SC_MOVE
-            user32.PostMessageW(hwnd, 0x0201, 1, 0)       # WM_LBUTTONDOWN
-        except Exception as e:
-            print(f"[drag] native drag failed: {e}")
 
     # ------------------------------------------------------------------ session
 
@@ -305,6 +295,9 @@ class MalvaApp:
 
         elif etype == "transcript_segment":
             self._call("addTranscriptSegment", event.get("data", {}))
+
+        elif etype == "transcript_partial":
+            self._call("showPartialTranscript", event.get("source", ""), event.get("text", ""))
 
         elif etype == "audio_levels":
             self._call("updateBars", event.get("source", ""), event.get("levels", []))
@@ -503,7 +496,9 @@ class MalvaApp:
             js_api=self._api,
             easy_drag=False,
         )
+        print("[app] starting window")
         webview.start(debug=False)
+        print("[app] window closed")
 
 
 # ------------------------------------------------------------------ main

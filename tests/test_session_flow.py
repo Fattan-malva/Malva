@@ -28,6 +28,7 @@ def real_db(tmp_path, monkeypatch):
 
 class FakeASR:
     language = "auto"
+    is_local = True
 
     def __init__(self, text="halo", model_used="local"):
         self.text = text
@@ -310,3 +311,81 @@ def test_stop_releases_sources_and_ends_session(fake_mic_only, real_db, monkeypa
     assert s._audio.active_sources == []
     assert "session_ended" in _types(events)
     time.sleep(0.05)  # let the background finaliser run once
+
+
+def _wait_for_event(events, etype, text=None, timeout=3.0):
+    import time as _t
+    end = _t.time() + timeout
+    while _t.time() < end:
+        for e in list(events):
+            if e.get("type") == etype and (text is None or e.get("text") == text):
+                return e
+        _t.sleep(0.01)
+    return None
+
+
+def test_live_partial_is_shown_but_never_stored(fake_mic_only, real_db):
+    events = []
+    s = _session("assistant", real_db, events, asr=FakeASR("sedang bicara"))
+    s.start()
+    try:
+        s._on_partial(b"wav", TrackSource.MICROPHONE, s.session_id)
+        evt = _wait_for_event(events, "transcript_partial", "sedang bicara")
+        assert evt is not None and evt["source"] == "microphone"
+        assert "transcript_segment" not in _types(events)
+    finally:
+        s.stop()
+
+
+def test_partial_is_dropped_while_a_final_is_in_flight(fake_mic_only, real_db):
+    import time as _t
+    events = []
+    s = _session("assistant", real_db, events, asr=FakeASR("tidak tampil"))
+    s.start()
+    try:
+        s._final_inflight = 1
+        s._on_partial(b"wav", TrackSource.MICROPHONE, s.session_id)
+        _t.sleep(0.3)
+        assert _wait_for_event(events, "transcript_partial", "tidak tampil", timeout=0.1) is None
+        s._final_inflight = 0
+    finally:
+        s.stop()
+
+
+def test_partial_never_uses_cloud_asr(fake_mic_only, real_db):
+    import time as _t
+
+    class CloudOnlyASR(FakeASR):
+        is_local = False
+
+        def __init__(self):
+            super().__init__("x")
+            self.calls = 0
+
+        def transcribe(self, wav):
+            self.calls += 1
+            return super().transcribe(wav)
+
+    events, asr = [], CloudOnlyASR()
+    s = _session("assistant", real_db, events, asr=asr)
+    s.start()
+    try:
+        s._on_partial(b"wav", TrackSource.MICROPHONE, s.session_id)
+        _t.sleep(0.3)
+        assert asr.calls == 0
+    finally:
+        s.stop()
+
+
+def test_final_utterance_clears_live_text(fake_mic_only, real_db):
+    events = []
+    s = _session("voice_input", real_db, events, asr=FakeASR("kalimat akhir"))
+    s.start()
+    try:
+        s._on_utterance(b"wav", TrackSource.MICROPHONE, s.session_id)
+        assert _wait_for_event(events, "voice_input_text", "kalimat akhir") is not None
+        clears = [e for e in events if e.get("type") == "transcript_partial" and e.get("text") == ""]
+        assert clears, "the final result must clear the live line"
+        assert s._final_inflight == 0
+    finally:
+        s.stop()

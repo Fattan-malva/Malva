@@ -97,3 +97,15 @@ def test_pywebviewready_bridge_is_wired():
     script = _inline_script(_page())
     assert "pywebviewready" in script
     assert "ui_ready" in script
+
+
+def test_window_drag_uses_pywebview_drag_region():
+    """Drag is pywebview's job: easy_drag is off and the statusbar is a drag region.
+
+    The old Win32 PostMessage(SC_MOVE) path did not capture the mouse and never moved the window.
+    """
+    page = _page()
+    assert 'id="statusbar" class="pywebview-drag-region"' in page
+    assert "easy_drag=False" in APP_SRC
+    assert "start_drag" not in page and "start_drag" not in APP_SRC
+    assert "SC_MOVE" not in APP_SRC

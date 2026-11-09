@@ -59,7 +59,7 @@ EVENT_TYPES = (
     "action_proposed", "action_result",
     "voice_input_text", "focus_mode", "sleep_mode",
     "interview_question", "interview_answer_draft", "interview_feedback", "interview_report",
-    "meeting_report", "asr_error", "report_error", "notice",
+    "meeting_report", "transcript_partial", "asr_error", "report_error", "notice",
 )
 
 _ASR_NOTICE_COOLDOWN = 30.0
@@ -109,10 +109,16 @@ class MalvaSession:
         self._practice_question = ""
         self._practice_answer: list[str] = []
 
+        # Finals always win over live text: partial passes are skipped while any final is in flight.
+        self._inflight_lock = threading.Lock()
+        self._final_inflight = 0
+        self._partial_guard = threading.Lock()
+
         self._audio = AudioEngine(
             session_id=self.session_id,
             mode=mode,
             on_utterance=self._on_utterance,
+            on_partial=self._on_partial,
             on_levels=self._on_audio_levels,
             on_error=self._on_capture_error,
             db=db,
@@ -390,7 +396,7 @@ class MalvaSession:
         if question:
             self._practice_question = question
         else:
-            self._emit({"type": "notice", "message": "Pertanyaan belum bisa dibuat. Periksa AI lokal."})
+            self._emit({"type": "notice", "message": "Pertanyaan belum bisa dibuat. Periksa AI cloud (OLLAMA_URL) dan opt-in di Setelan."})
         return question
 
     def finish_practice(self) -> None:
@@ -405,6 +411,8 @@ class MalvaSession:
         """Called by AudioEngine for each finished utterance (worker thread)."""
         if not self._running or self._paused or self._sleeping:
             return
+        with self._inflight_lock:
+            self._final_inflight += 1
         self._set_state(SessionState.PROCESSING)
         try:
             self.touch()
@@ -422,6 +430,7 @@ class MalvaSession:
             track = self._audio.get_track(source)
             track_id = track.track_id if track else ""
             self._transcript.ingest(result, track_id=track_id, source_type=source.value)
+            self._emit({"type": "transcript_partial", "source": source.value, "text": ""})
 
             if self.mode == "voice_input":
                 self._emit({"type": "voice_input_text", "text": text})
@@ -443,7 +452,49 @@ class MalvaSession:
             if action:
                 self.propose_action(action["tool"], action.get("args", {}), origin="speech")
         finally:
+            self._emit({"type": "transcript_partial", "source": source.value, "text": ""})
+            with self._inflight_lock:
+                self._final_inflight -= 1
             self._restore_state()
+
+    def _on_partial(self, wav_bytes: bytes, source: TrackSource, session_id: str) -> None:
+        """Live text while someone is still speaking (called from the capture thread).
+
+        Local model only: partial passes never go to cloud ASR and never reach the
+        transcript store. They are skipped while a final transcription is running or
+        another partial is in progress, so live text cannot delay the final result.
+        """
+        if not self._running or self._paused or self._sleeping:
+            return
+        if not self._asr.is_local:
+            return
+        with self._inflight_lock:
+            if self._final_inflight:
+                return
+        if not self._partial_guard.acquire(blocking=False):
+            return
+        try:
+            threading.Thread(target=self._run_partial, args=(wav_bytes, source),
+                             daemon=True, name="malva-partial").start()
+        except Exception:
+            self._partial_guard.release()
+            raise
+
+    def _run_partial(self, wav_bytes: bytes, source: TrackSource) -> None:
+        try:
+            self._asr.language = self._db.get_setting("asr_language", "auto")
+            result = self._asr.transcribe(wav_bytes)
+            text = (result.full_text or "").strip()
+            if not text or result.model_used in (LOCAL_MODEL_REQUIRED, LOCAL_FAILED):
+                return
+            with self._inflight_lock:
+                if self._final_inflight or not self._running or self._paused or self._sleeping:
+                    return
+            self._emit({"type": "transcript_partial", "source": source.value, "text": text})
+        except Exception as e:
+            print(f"[asr] partial transcription failed: {e}")
+        finally:
+            self._partial_guard.release()
 
     def _restore_state(self) -> None:
         if not self._running:
