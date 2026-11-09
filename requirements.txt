@@ -1,16 +1,15 @@
 # Direct runtime dependencies (dependensi transitif dipasang otomatis oleh pip).
 # Python 3.10+ / Windows 10-11.
 
-# Audio + speech input
+# Audio input
 pyaudio==0.2.14
 pyaudiowpatch==0.2.12.9
 sounddevice==0.5.2
 numpy==2.2.6
 scipy==1.16.1
-SpeechRecognition==3.14.3
-faster-whisper==1.2.1
 
-# LLM / web / config
+# Cloud speech (Gemini Live transcription) and LLM / web / config
+google-genai
 httpx==0.27.0
 python-dotenv==1.0.1
 

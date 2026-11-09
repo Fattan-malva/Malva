@@ -53,7 +53,7 @@ class MeetingEngine:
         # Summary (AI-generated, stored separately from transcript)
         summary = self._ai.summarize_transcript(transcript_text, task="meeting")
         if not summary.strip():
-            summary = "(Ringkasan AI tidak tersedia. AI memakai Ollama cloud: atur OLLAMA_URL dan aktifkan cloud di Setelan.)"
+            summary = "(Ringkasan AI tidak tersedia. AI memakai Ollama cloud: atur OLLAMA_URL dan pastikan CLOUD_ENABLED tidak false.)"
 
         # Decisions
         decisions = self._ai.extract_decisions(transcript_text)

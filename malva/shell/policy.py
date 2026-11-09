@@ -58,3 +58,28 @@ def parse_sleep_seconds(raw: str | None, default: float = 60.0) -> float:
     if value != value:  # NaN
         return default
     return max(0.0, value)
+
+
+# ------------------------------------------------------------------ voice approval
+
+APPROVE_PHRASES = frozenset({"setuju", "ya hapus", "iya hapus", "hapus saja", "lanjutkan hapus", "setuju hapus"})
+REJECT_PHRASES = frozenset({"batal", "tolak", "jangan", "tidak jadi", "batalkan"})
+VOICE_APPROVAL_WINDOW_SECONDS = 120.0
+
+
+def normalize_utterance(text: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in (text or "").lower())
+    return " ".join(cleaned.split())
+
+
+def voice_decision(text: str) -> str | None:
+    """'approve' or 'reject' when the whole utterance is exactly one decision phrase, else None.
+
+    Only a complete phrase counts. A sentence that merely contains the word does not.
+    """
+    phrase = normalize_utterance(text)
+    if phrase in APPROVE_PHRASES:
+        return "approve"
+    if phrase in REJECT_PHRASES:
+        return "reject"
+    return None

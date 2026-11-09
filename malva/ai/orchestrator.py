@@ -200,7 +200,7 @@ class AIOrchestrator:
             return False
         if self._privacy is None or not self._privacy.allows_llm():
             self._report_error(
-                "AI memakai Ollama cloud. Aktifkan 'Izinkan cloud' di tab Setelan untuk memakainya."
+                "AI memakai Ollama cloud, tetapi CLOUD_ENABLED=false di .env."
             )
             return False
         return True

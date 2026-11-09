@@ -1,16 +1,13 @@
 """
-malva.privacy.manager — Processing policy, cloud opt-in, and Hidden Mode (Blueprint §11).
+malva.privacy.manager — Cloud policy and Hidden Mode (Blueprint §3, §11).
 
-Single source of truth for "may this data leave the machine?":
+Cloud processing is approved by product decision (Blueprint §3): speech recognition
+(Gemini), the LLM (Ollama cloud) and web search all use cloud services. The approval
+is a configuration value, not a per-user toggle, and it is visible in the Setelan tab.
 
-  * cloud_processing is OFF by default and is only turned on by an explicit
-    user action (set_cloud_processing(True)). It is persisted in app_settings.
-  * It is NOT inferred from environment variables or endpoint URLs. Earlier
-    code treated "OLLAMA_URL is not localhost" as consent, which silently
-    sent audio and prompts to a cloud provider.
-  * ASR (Google STT) and the LLM (remote endpoints) both ask this manager
-    before any network call. Blocked calls return a typed reason so the UI
-    can say what is missing (e.g. "download a local model").
+  * CLOUD_ENABLED (default "true") is the only switch. Set it to "false" to block every
+    cloud call. Each blocked call returns a typed reason so the UI can say what is missing.
+  * Nothing is ever sent to a different service than the ones listed in Blueprint §3.
 
 Hidden Mode uses SetWindowDisplayAffinity (WDA_EXCLUDEFROMCAPTURE). It is NOT
 a universal invisibility guarantee; status is always reported honestly.
@@ -20,27 +17,13 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes  # noqa: F401  (used by Hidden Mode on Windows)
+import os
 from enum import Enum
 from typing import Callable
-from urllib.parse import urlparse
 
 # WDA_EXCLUDEFROMCAPTURE = 0x11 (Windows 10 2004+)
 WDA_NONE                = 0x00
 WDA_EXCLUDEFROMCAPTURE  = 0x11
-
-_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
-
-
-def is_remote_endpoint(url: str) -> bool:
-    """True when `url` points somewhere other than this machine. Empty = not remote."""
-    if not url or not url.strip():
-        return False
-    host = (urlparse(url.strip()).hostname or "").lower()
-    if not host:
-        # Unparseable input is treated as remote: fail closed.
-        return True
-    return host not in _LOCAL_HOSTS
-
 
 class HiddenModeStatus(str, Enum):
     DISABLED    = "disabled"
@@ -49,69 +32,32 @@ class HiddenModeStatus(str, Enum):
     FAILED      = "failed"
 
 
+def cloud_enabled_from_env() -> bool:
+    """CLOUD_ENABLED defaults to true. Only an explicit false/0/no/off turns cloud off."""
+    return os.getenv("CLOUD_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
 class PrivacyManager:
-    """Holds the processing policy and Hidden Mode state."""
+    """Holds the cloud policy and Hidden Mode state."""
 
-    SETTING_KEY = "cloud_processing"
-
-    def __init__(
-        self,
-        on_status_change: Callable[[str, str], None] | None = None,
-        db=None,
-    ):
+    def __init__(self, on_status_change: Callable[[str, str], None] | None = None):
         """on_status_change(component, status_string) is called on every change."""
         self._on_status_change  = on_status_change
-        self._db                = db
         self.hidden_mode_status = HiddenModeStatus.DISABLED
         self._hwnd: int | None  = None
-        self.cloud_processing   = self._load_cloud_setting()
+        self.cloud_enabled      = cloud_enabled_from_env()
 
     # ------------------------------------------------------------------ policy
 
-    @property
-    def local_only(self) -> bool:
-        return not self.cloud_processing
+    def allows_cloud(self) -> bool:
+        """The single cloud gate. Speech, LLM and web search all ask this."""
+        return self.cloud_enabled
 
     def allows_cloud_asr(self) -> bool:
-        """Google STT (or any cloud speech API) may be used only with explicit opt-in."""
-        return self.cloud_processing
+        return self.allows_cloud()
 
     def allows_llm(self) -> bool:
-        """The LLM is always a cloud service (Ollama endpoint from OLLAMA_URL).
-
-        There is no local LLM in Malva. Local speech recognition (faster-whisper) is
-        the only on-device model. So every chat, summary, and feedback request needs
-        the explicit cloud opt-in, whatever host the URL points to.
-        """
-        return self.cloud_processing
-
-    def allows_remote_endpoint(self, url: str) -> bool:
-        """Kept for callers that pass a URL. The URL does not change the answer: the LLM is cloud."""
-        return self.allows_llm()
-
-    def set_cloud_processing(self, enabled: bool) -> None:
-        """Explicit user action only. Persisted so the choice survives restarts."""
-        self.cloud_processing = bool(enabled)
-        if self._db is not None:
-            try:
-                self._db.set_setting(self.SETTING_KEY, "1" if enabled else "0")
-            except Exception as e:
-                print(f"[privacy] could not persist cloud setting: {e}")
-        self._notify("cloud_processing", "enabled" if enabled else "disabled")
-
-    def enable_cloud_processing(self) -> None:
-        self.set_cloud_processing(True)
-
-    def disable_cloud_processing(self) -> None:
-        self.set_cloud_processing(False)
-
-    def _load_cloud_setting(self) -> bool:
-        if self._db is None:
-            return False
-        try:
-            return self._db.get_setting(self.SETTING_KEY, "0") == "1"
-        except Exception:
-            return False  # fail closed
+        return self.allows_cloud()
 
     # ------------------------------------------------------------------ Hidden Mode
 
@@ -157,9 +103,8 @@ class PrivacyManager:
 
     def get_status(self) -> dict:
         return {
-            "hidden_mode":      self.hidden_mode_status.value,
-            "cloud_processing": self.cloud_processing,
-            "local_only":       self.local_only,
+            "hidden_mode": self.hidden_mode_status.value,
+            "cloud_enabled": self.cloud_enabled,
         }
 
     def _notify(self, component: str, status: str) -> None:

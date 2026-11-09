@@ -141,17 +141,6 @@ def _create_tables() -> None:
         created_at  REAL NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS model_registry (
-        id          TEXT PRIMARY KEY,
-        engine      TEXT NOT NULL,          -- faster_whisper|qwen3_asr|google_stt
-        model_size  TEXT,
-        model_path  TEXT,
-        device      TEXT DEFAULT 'cpu',
-        language    TEXT DEFAULT 'auto',
-        is_active   INTEGER DEFAULT 0,
-        metadata    TEXT DEFAULT '{}'
-    );
-
     CREATE TABLE IF NOT EXISTS app_settings (
         key         TEXT PRIMARY KEY,
         value       TEXT,

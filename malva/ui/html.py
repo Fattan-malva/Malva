@@ -968,17 +968,18 @@ details.transcript-full pre { white-space: pre-wrap; font-family: 'JetBrains Mon
           </select>
         </div>
 
-        <div class="settings-section-title">Model ASR lokal (Whisper)</div>
-        <div id="modelsContainer"></div>
-        <div id="asrGlobalStatus" class="muted" style="margin:4px 0 10px"></div>
-
-        <div class="settings-section-title">Privasi</div>
+        <div class="settings-section-title">Transkripsi dan layanan cloud</div>
         <div class="setting-row" style="align-items:flex-start">
           <div style="flex:1">
-            <div style="font-size:12px;font-weight:500">Izinkan cloud</div>
+            <div style="font-size:12px;font-weight:500">Gemini (transkripsi)</div>
+            <div id="asrGlobalStatus" class="privacy-status" style="margin-top:3px"></div>
+          </div>
+        </div>
+        <div class="setting-row" style="align-items:flex-start">
+          <div style="flex:1">
+            <div style="font-size:12px;font-weight:500">Layanan cloud</div>
             <div id="cloudStatus" class="privacy-status" style="margin-top:3px"></div>
           </div>
-          <button id="cloudToggleBtn" class="toggle-switch" onclick="window._toggleCloud()">Nonaktif</button>
         </div>
 
         <div class="settings-section-title">Kontrol sesi</div>
@@ -1042,7 +1043,7 @@ details.transcript-full pre { white-space: pre-wrap; font-family: 'JetBrains Mon
 const S = {
   mode: 'assistant', state: 'idle', expanded: false, sleeping: false, paused: false,
   focusMode: false, hiddenStatus: 'disabled', sources: [], sourceStates: {}, sysAudio: false,
-  cloud: false, answerRaw: '', modelsCatalog: [], activeModelInfo: {}, practiceQuestion: ''
+  cloud: false, answerRaw: '', activeModelInfo: {}, practiceQuestion: ''
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1052,7 +1053,7 @@ const answerArea = $('answerArea'), spinnerRow = $('spinnerRow'), spinnerLabel =
 const transcriptList = $('transcriptList'), spectrum = $('spectrum'), bars = spectrum.querySelectorAll('.bar');
 const expandBtn = $('expandBtn'), noticeBar = $('noticeBar'), noticeText = $('noticeText'), noticeActions = $('noticeActions');
 const pendingArea = $('pendingArea'), voiceArea = $('voiceArea'), tabContent = $('tabContent');
-const modelsContainer = $('modelsContainer'), asrGlobalStatus = $('asrGlobalStatus'), pauseIcon = $('pauseIcon');
+const asrGlobalStatus = $('asrGlobalStatus'), pauseIcon = $('pauseIcon');
 
 function esc(value) {
   return String(value == null ? '' : value).replace(/[&<>"']/g, (c) => (
@@ -1352,21 +1353,10 @@ window._toggleHidden = function() {
 };
 
 window.updatePrivacy = function(p) {
-  S.cloud = !!(p && p.cloud_processing);
+  S.cloud = !!(p && p.cloud_enabled);
   $('cloudStatus').innerHTML = S.cloud
-    ? '<strong>Cloud diizinkan.</strong> <span class="privacy-warning">Audio dan transkrip bisa dikirim ke Google Speech dan endpoint AI jarak jauh.</span>'
-    : '<strong>Lokal saja.</strong> Audio dan teks tidak dikirim ke luar komputer ini.';
-  const b = $('cloudToggleBtn');
-  b.textContent = S.cloud ? 'Aktif' : 'Nonaktif';
-  b.className = S.cloud ? 'toggle-switch on' : 'toggle-switch';
-};
-
-window._toggleCloud = function() {
-  if (S.cloud) { call('set_cloud_processing', false); return; }
-  showNotice('warning', 'Aktifkan cloud? Audio dan teks bisa dikirim ke layanan pihak ketiga.', [
-    { label: 'Aktifkan', primary: true, onClick: () => call('set_cloud_processing', true) },
-    { label: 'Batal', primary: false, onClick: () => {} }
-  ]);
+    ? '<strong>Diizinkan.</strong> <span class="privacy-warning">Audio, teks, dan pencarian web dikirim ke layanan cloud: Gemini (transkripsi), Ollama (AI), dan pencarian web.</span>'
+    : '<strong>Dimatikan.</strong> Atur CLOUD_ENABLED=true di .env untuk mengizinkan. Transkripsi, AI, dan pencarian web tidak berjalan.';
 };
 
 // ==========================================================================
@@ -1736,58 +1726,20 @@ window.showInterviewFeedback = function(d) {
 
 
 // ==========================================================================
-// ASR MODEL MANAGEMENT
+// ASR STATUS
 // ==========================================================================
 window.updateASRStatus = function(payload) {
   if (!payload) return;
-  S.activeModelInfo = payload.info || {};
-  S.modelsCatalog = payload.catalog || [];
-  $('langSelect').value = S.activeModelInfo.language_setting || 'auto';
-  renderModels();
-  const isLocal = !!S.activeModelInfo.is_local;
-  const modelName = S.activeModelInfo.model || 'Belum ada model lokal';
-  asrGlobalStatus.innerHTML = 'Model aktif: <strong></strong> (' + (isLocal ? 'lokal di CPU' : 'belum lokal') + ')';
-  asrGlobalStatus.querySelector('strong').textContent = modelName;
+  const info = payload.info || {};
+  S.activeModelInfo = info;
+  $('langSelect').value = info.language_setting || 'auto';
+  asrGlobalStatus.innerHTML = '';
+  const name = document.createElement('strong');
+  name.textContent = info.model || 'Gemini';
+  asrGlobalStatus.appendChild(name);
+  asrGlobalStatus.appendChild(document.createTextNode(
+    info.ready ? ' siap (cloud, streaming)' : ' belum siap: ' + (info.reason || '')));
 };
-
-window.onASRStatusUpdate = function(data) {
-  if (!data) return;
-  if (data.status === 'downloading' || data.status === 'loading') {
-    spinnerLabel.textContent = data.message || 'Memuat model ASR…';
-    spinnerRow.classList.add('show');
-  } else {
-    spinnerRow.classList.remove('show');
-  }
-  if (data.status === 'error' && data.message) showNotice('error', data.message);
-};
-
-function renderModels() {
-  modelsContainer.innerHTML = '';
-  S.modelsCatalog.forEach((m) => {
-    const card = document.createElement('div');
-    card.className = 'model-card' + (m.is_active ? ' active-model' : '');
-    let badge;
-    if (m.is_active) badge = '<span class="status-pill active">Aktif</span>';
-    else if (m.is_loading) badge = '<span class="status-pill downloading">Memuat…</span>';
-    else if (m.is_cached) badge = '<span class="status-pill cached">Tersimpan</span>';
-    else badge = '<span class="status-pill" style="color:var(--text-muted);border:1px solid var(--border-subtle)">Belum diunduh</span>';
-
-    let btn;
-    if (m.is_active) btn = '<span style="font-size:10px;color:var(--text-muted);font-weight:600">Digunakan</span>';
-    else if (m.is_cached) btn = '<button class="btn-action" data-model="' + esc(m.id) + '">Gunakan</button>';
-    else btn = '<button class="btn-action" data-model="' + esc(m.id) + '">Unduh (' + esc(m.size_mb) + ' MB)</button>';
-
-    card.innerHTML =
-      '<div class="model-card-header"><div style="font-size:12px;font-weight:600;color:#f1f5f9">' + esc(m.name) +
-      (m.recommended ? ' <span style="font-size:9px;padding:1px 4px;border-radius:3px;background:#1a1a1e;color:#a1a1aa;border:1px solid #333338">Rekomendasi</span>' : '') +
-      '</div>' + badge + '</div>' +
-      '<div style="display:flex;align-items:center;justify-content:space-between;font-size:10px;color:var(--text-muted);margin-top:2px">' +
-      '<span>' + esc(m.desc) + '</span>' + btn + '</div>';
-    const action = card.querySelector('[data-model]');
-    if (action) action.onclick = () => call('download_and_load_model', m.id);
-    modelsContainer.appendChild(card);
-  });
-}
 
 $('langSelect').value = 'auto';
 
@@ -1805,7 +1757,7 @@ function sendReady() {
 window.addEventListener('pywebviewready', sendReady);
 window.addEventListener('load', () => {
   window.updateHiddenMode('disabled');
-  window.updatePrivacy({ cloud_processing: false });
+  window.updatePrivacy({ cloud_enabled: false });
   sendReady();
 });
 

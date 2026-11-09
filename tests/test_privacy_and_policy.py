@@ -1,15 +1,18 @@
 """
-Local-first policy (audit P0 privacy) and Sleep/Focus rules.
+Cloud policy (CLOUD_ENABLED), cloud ASR gating, approval rules, and Sleep/Focus rules.
 
-These tests assert that NO remote call happens unless the user has opted in,
-and that the opt-in is a persisted user choice, not something read from env.
+Cloud is approved by product decision (Blueprint §3). These tests check that the single
+switch works and that a disabled cloud or a missing key blocks every remote call.
 """
 
-import numpy as np
 import pytest
 
-from malva.privacy.manager import PrivacyManager, is_remote_endpoint
-from malva.shell.policy import parse_sleep_seconds, should_auto_sleep
+from malva.asr import types as asr_types
+from malva.asr.gemini_live import language_codes_for
+from malva.asr.service import ASRService
+from malva.desktop import gateway
+from malva.privacy.manager import PrivacyManager, cloud_enabled_from_env
+from malva.shell.policy import parse_sleep_seconds, should_auto_sleep, voice_decision
 
 
 class FakeDB:
@@ -22,182 +25,179 @@ class FakeDB:
     def set_setting(self, key, value):
         self.values[key] = value
 
+    def log_tool_action(self, **kwargs):
+        self.values.setdefault("_audit", []).append(kwargs)
 
-# ------------------------------------------------------------------ endpoint classification
 
-@pytest.mark.parametrize("url, remote", [
-    ("", False),
-    ("http://localhost:11434/v1/chat/completions", False),
-    ("http://127.0.0.1:11434/v1", False),
-    ("https://ollama.com/v1/chat/completions", True),
-    ("https://api.example.org/x", True),
-    ("not a url at all", True),        # fail closed
+# ------------------------------------------------------------------ CLOUD_ENABLED switch
+
+@pytest.mark.parametrize("raw, enabled", [
+    (None, True), ("", True), ("true", True), ("1", True),
+    ("false", False), ("FALSE", False), ("0", False), ("no", False), ("off", False),
 ])
-def test_endpoint_classification(url, remote):
-    assert is_remote_endpoint(url) is remote
+def test_cloud_switch_defaults_to_enabled(monkeypatch, raw, enabled):
+    if raw is None:
+        monkeypatch.delenv("CLOUD_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("CLOUD_ENABLED", raw)
+    assert cloud_enabled_from_env() is enabled
+    assert PrivacyManager().allows_cloud() is enabled
 
 
-# ------------------------------------------------------------------ cloud opt-in
-
-def test_cloud_is_off_by_default_even_if_env_points_to_cloud(monkeypatch):
-    monkeypatch.setenv("OLLAMA_URL", "https://ollama.com/v1/chat/completions")
-    pm = PrivacyManager(db=FakeDB())
-    assert pm.local_only is True
-    assert pm.allows_cloud_asr() is False
-    assert pm.allows_remote_endpoint("https://ollama.com/v1/chat/completions") is False
+def test_privacy_status_reports_cloud_enabled(monkeypatch):
+    monkeypatch.setenv("CLOUD_ENABLED", "false")
+    status = PrivacyManager().get_status()
+    assert status["cloud_enabled"] is False
+    assert "cloud_processing" not in status
 
 
-def test_opt_in_is_persisted_and_reloaded():
-    db = FakeDB()
-    pm = PrivacyManager(db=db)
-    pm.set_cloud_processing(True)
-    assert db.values["cloud_processing"] == "1"
-    reloaded = PrivacyManager(db=db)
-    assert reloaded.cloud_processing is True
-    assert reloaded.allows_remote_endpoint("https://ollama.com/v1") is True
+# ------------------------------------------------------------------ ASR gating
+
+def _service(privacy, key="k-test", language="id"):
+    return ASRService(privacy=privacy, api_key=key, language_getter=lambda: language)
 
 
-def test_opt_in_can_be_revoked():
-    db = FakeDB({"cloud_processing": "1"})
-    pm = PrivacyManager(db=db)
-    pm.set_cloud_processing(False)
-    assert PrivacyManager(db=db).local_only is True
-
-
-def test_localhost_llm_is_still_cloud_without_opt_in():
-    pm = PrivacyManager(db=FakeDB())
-    # Malva has no local LLM: even a localhost URL is the Ollama cloud path and needs the opt-in.
-    assert pm.allows_remote_endpoint("http://localhost:11434/v1") is False
-    pm.set_cloud_processing(True)
-    assert pm.allows_remote_endpoint("http://localhost:11434/v1") is True
-
-
-def test_db_read_failure_fails_closed():
-    class Broken:
-        def get_setting(self, *a, **k):
-            raise RuntimeError("db down")
-    assert PrivacyManager(db=Broken()).cloud_processing is False
-
-
-# ------------------------------------------------------------------ ASR never uploads silently
-
-def _audio_stub():
-    import io, wave
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
-        wf.writeframes(np.zeros(1600, dtype=np.int16).tobytes())
-    return buf.getvalue()
-
-
-def test_asr_without_local_model_does_not_call_google(monkeypatch):
-    from malva.asr import router as asr
-
-    router = asr.ASRRouter(auto_load=False, privacy_manager=PrivacyManager(db=FakeDB()))
-    calls = []
-    monkeypatch.setattr(router, "_transcribe_cloud", lambda wav: calls.append(wav) or asr.ASRResult(full_text="x", language="id"))
-    result = router.transcribe(_audio_stub())
-    assert calls == []
-    assert result.model_used == asr.LOCAL_MODEL_REQUIRED
-    assert result.full_text == ""
-
-
-def test_asr_local_failure_does_not_fall_back_to_cloud(monkeypatch):
-    from malva.asr import router as asr
-
-    class ExplodingModel:
-        def transcribe(self, *a, **k):
-            raise RuntimeError("cuda oom")
-
-    router = asr.ASRRouter(auto_load=False, privacy_manager=PrivacyManager(db=FakeDB()))
-    router._model = ExplodingModel()
-    calls = []
-    monkeypatch.setattr(router, "_transcribe_cloud", lambda wav: calls.append(wav))
-    result = router.transcribe(_audio_stub())
-    assert calls == []
-    assert result.model_used == asr.LOCAL_FAILED
-
-
-def test_asr_cloud_used_only_after_opt_in(monkeypatch):
-    from malva.asr import router as asr
-
-    pm = PrivacyManager(db=FakeDB({"cloud_processing": "1"}))
-    router = asr.ASRRouter(auto_load=False, privacy_manager=pm)
-    monkeypatch.setattr(router, "_transcribe_cloud",
-                        lambda wav: asr.ASRResult(full_text="halo", language="id", model_used="cloud/google-stt"))
-    assert router.transcribe(_audio_stub()).full_text == "halo"
-
-
-def test_asr_without_privacy_manager_fails_closed(monkeypatch):
-    from malva.asr import router as asr
-
-    router = asr.ASRRouter(auto_load=False, privacy_manager=None)
-    calls = []
-    monkeypatch.setattr(router, "_transcribe_cloud", lambda wav: calls.append(wav))
-    router.transcribe(_audio_stub())
-    assert calls == []
-
-
-# ------------------------------------------------------------------ LLM never calls remote silently
-
-class RecordingClient:
-    calls: list = []
-
-    def __init__(self, *a, **k):
-        pass
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-    def stream(self, *a, **k):
-        RecordingClient.calls.append(("stream", a, k))
-        raise RuntimeError("should not reach network")
-
-    def post(self, *a, **k):
-        RecordingClient.calls.append(("post", a, k))
-        raise RuntimeError("should not reach network")
-
-
-def test_llm_remote_endpoint_blocked_in_local_only(monkeypatch):
-    from malva.ai import orchestrator as orc
-
-    RecordingClient.calls = []
-    monkeypatch.setattr(orc, "OLLAMA_URL", "https://ollama.com/v1/chat/completions")
-    monkeypatch.setattr(orc.httpx, "Client", RecordingClient)
-
-    ai = orc.AIOrchestrator("s1", "assistant", db=None, privacy_manager=PrivacyManager(db=FakeDB()))
+def test_asr_without_key_reports_not_configured_and_opens_nothing(monkeypatch):
+    monkeypatch.setenv("CLOUD_ENABLED", "true")
     errors = []
-    ai.on_error = errors.append
-    text, action = ai.ask("halo")
-    assert RecordingClient.calls == [], "no HTTP request may be made"
-    assert text == "" and action is None
-    assert errors and "Ollama cloud" in errors[0]
+    stream = _service(PrivacyManager(), key="").open_stream(
+        "microphone", on_partial=lambda t: None, on_final=lambda t: None,
+        on_error=lambda code, msg: errors.append(code))
+    assert stream is None
+    assert errors == [asr_types.ASR_NOT_CONFIGURED]
 
 
-def test_llm_remote_endpoint_allowed_after_opt_in(monkeypatch):
+def test_asr_with_cloud_disabled_opens_nothing(monkeypatch):
+    monkeypatch.setenv("CLOUD_ENABLED", "false")
+    errors = []
+    stream = _service(PrivacyManager()).open_stream(
+        "microphone", on_partial=lambda t: None, on_final=lambda t: None,
+        on_error=lambda code, msg: errors.append(code))
+    assert stream is None
+    assert errors == [asr_types.ASR_CLOUD_DISABLED]
+
+
+def test_asr_with_key_and_cloud_starts_a_stream(monkeypatch):
+    from malva.asr import gemini_live
+    monkeypatch.setenv("CLOUD_ENABLED", "true")
+    started = []
+    monkeypatch.setattr(gemini_live.GeminiLiveStream, "start", lambda self: started.append(self._codes))
+    stream = _service(PrivacyManager(), language="id").open_stream(
+        "microphone", on_partial=lambda t: None, on_final=lambda t: None, on_error=lambda c, m: None)
+    assert stream is not None
+    assert started == [["id-ID"]]
+
+
+def test_asr_status_shows_reason_when_blocked(monkeypatch):
+    monkeypatch.setenv("CLOUD_ENABLED", "true")
+    status = _service(PrivacyManager(), key="").status()
+    assert status["ready"] is False and status["configured"] is False
+    assert "GEMINI_API_KEY" in status["reason"]
+
+
+@pytest.mark.parametrize("setting, codes", [
+    ("auto", []), ("", []), ("id", ["id-ID"]), ("en", ["en-US"]), ("ja-JP", ["ja-JP"]), ("xx", []),
+])
+def test_language_setting_maps_to_gemini_codes(setting, codes):
+    assert language_codes_for(setting) == codes
+
+
+# ------------------------------------------------------------------ LLM and web honour the switch
+
+def test_llm_makes_no_http_call_when_cloud_disabled(monkeypatch):
     from malva.ai import orchestrator as orc
 
-    RecordingClient.calls = []
+    class NoHttp:
+        def __init__(self, *a, **k):
+            raise AssertionError("no HTTP request may be made while CLOUD_ENABLED=false")
+
+    monkeypatch.setenv("CLOUD_ENABLED", "false")
+    monkeypatch.setattr(orc.httpx, "Client", NoHttp)
     monkeypatch.setattr(orc, "OLLAMA_URL", "https://ollama.com/v1/chat/completions")
-    monkeypatch.setattr(orc.httpx, "Client", RecordingClient)
-    ai = orc.AIOrchestrator("s1", "assistant", db=None,
-                            privacy_manager=PrivacyManager(db=FakeDB({"cloud_processing": "1"})))
-    ai.ask("halo")  # network stub raises; orchestrator must still attempt the call
-    assert RecordingClient.calls, "opted-in cloud request should be attempted"
-
-
-def test_llm_missing_endpoint_is_reported(monkeypatch):
-    from malva.ai import orchestrator as orc
-
-    monkeypatch.setattr(orc, "OLLAMA_URL", "")
-    ai = orc.AIOrchestrator("s1", "assistant", db=None, privacy_manager=PrivacyManager(db=FakeDB()))
+    ai = orc.AIOrchestrator("s1", "assistant", db=None, privacy_manager=PrivacyManager())
     errors = []
     ai.on_error = errors.append
     ai.ask("halo")
-    assert errors and "OLLAMA_URL" in errors[0]
+    assert errors and "CLOUD_ENABLED" in errors[0]
+
+
+def test_web_search_blocked_when_cloud_disabled(monkeypatch):
+    from malva.desktop.tools import ollama as web_backend
+
+    class NoHttp:
+        def __init__(self, *a, **k):
+            raise AssertionError("no HTTP request may be made while cloud is disabled")
+
+    monkeypatch.setattr(web_backend.httpx, "Client", NoHttp)
+    web_backend.set_cloud_gate(lambda: False)
+    try:
+        with pytest.raises(web_backend.WebError, match="CLOUD_ENABLED"):
+            web_backend.web_search("berita hari ini")
+    finally:
+        web_backend.set_cloud_gate(lambda: False)
+
+
+def test_web_search_reaches_backend_when_cloud_enabled(monkeypatch):
+    from malva.desktop.tools import ollama as web_backend
+
+    seen = []
+    monkeypatch.setattr(web_backend, "_post_native", lambda path, payload, timeout=None: seen.append(path) or {"results": []})
+    monkeypatch.setattr(web_backend, "_ddg_search", lambda q, n: [{"title": "t", "url": "https://x", "content": "c"}])
+    web_backend.set_cloud_gate(lambda: True)
+    try:
+        out = web_backend.web_search("halo")
+    finally:
+        web_backend.set_cloud_gate(lambda: False)
+    assert seen == ["/api/web_search"] and out["results"]
+
+
+# ------------------------------------------------------------------ approval: delete only
+
+@pytest.mark.parametrize("tool, args, needs", [
+    ("list_windows", {}, False),
+    ("browser_close_tab", {"title": "Gmail"}, False),
+    ("close_browser", {}, False),
+    ("type_text", {"text": "halo dunia"}, False),
+    ("run_command", {"command": "dir"}, False),
+    ("delete_file", {"path": "C:/x.txt"}, True),
+    ("run_command", {"command": "del C:/x.txt"}, True),
+    ("type_text", {"text": "delete the file"}, True),
+])
+def test_only_destructive_calls_need_approval(tool, args, needs):
+    assert gateway.requires_approval(tool, args) is needs
+
+
+def test_destructive_call_without_approval_is_refused(monkeypatch):
+    ran = []
+    monkeypatch.setattr(gateway.DesktopGateway, "_dispatch", lambda self, t, a: ran.append(t) or {})
+    gw = gateway.DesktopGateway(session_id="s1", db=FakeDB(), tools_enabled=True)
+    result = gw.run("delete_file", {"path": "C:/x.txt"})
+    assert result["ok"] is False and ran == []
+
+
+def test_destructive_call_runs_once_approved(monkeypatch):
+    ran = []
+    monkeypatch.setattr(gateway.DesktopGateway, "_dispatch", lambda self, t, a: ran.append(t) or {"done": True})
+    gw = gateway.DesktopGateway(session_id="s1", db=FakeDB(), tools_enabled=True)
+    result = gw.run("delete_file", {"path": "C:/x.txt"}, approved=True)
+    assert result["ok"] is True and ran == ["delete_file"]
+
+
+def test_non_destructive_call_runs_without_approval(monkeypatch):
+    ran = []
+    monkeypatch.setattr(gateway.DesktopGateway, "_dispatch", lambda self, t, a: ran.append(t) or {})
+    gw = gateway.DesktopGateway(session_id="s1", db=FakeDB(), tools_enabled=True)
+    assert gw.run("close_browser", {})["ok"] is True
+    assert ran == ["close_browser"]
+
+
+@pytest.mark.parametrize("text, decision", [
+    ("setuju", "approve"), ("Setuju.", "approve"), ("ya hapus", "approve"),
+    ("batal", "reject"), ("Tidak jadi!", "reject"), ("saya setuju dengan rencana ini", None),
+    ("hapus file itu", None), ("", None),
+])
+def test_voice_decision_needs_the_whole_phrase(text, decision):
+    assert voice_decision(text) == decision
 
 
 # ------------------------------------------------------------------ Sleep / Focus policy
@@ -240,33 +240,3 @@ def test_sleep_seconds_parsing(raw, expected):
     assert parse_sleep_seconds(raw) == expected
 
 
-def test_web_search_is_blocked_without_cloud_opt_in(monkeypatch):
-    """Queries sent to Ollama or DuckDuckGo are third-party processing: opt-in only."""
-    from malva.desktop.tools import ollama as web_backend
-
-    class NoHttp:
-        def __init__(self, *a, **k):
-            raise AssertionError("no HTTP request may be made without opt-in")
-
-    monkeypatch.setattr(web_backend.httpx, "Client", NoHttp)
-    web_backend.set_cloud_gate(lambda: False)
-    try:
-        import pytest
-        with pytest.raises(web_backend.WebError, match="Izinkan cloud"):
-            web_backend.web_search("berita hari ini")
-    finally:
-        web_backend.set_cloud_gate(lambda: False)
-
-
-def test_web_search_allowed_after_opt_in_reaches_backend(monkeypatch):
-    from malva.desktop.tools import ollama as web_backend
-
-    seen = []
-    monkeypatch.setattr(web_backend, "_post_native", lambda path, payload, timeout=None: seen.append(path) or {"results": []})
-    monkeypatch.setattr(web_backend, "_ddg_search", lambda q, n: [{"title": "t", "url": "https://x", "content": "c"}])
-    web_backend.set_cloud_gate(lambda: True)
-    try:
-        out = web_backend.web_search("halo")
-    finally:
-        web_backend.set_cloud_gate(lambda: False)
-    assert seen == ["/api/web_search"] and out["results"]

@@ -12,7 +12,7 @@ import time
 import pytest
 
 from conftest import FakePA
-from malva.asr.router import ASRResult, LOCAL_MODEL_REQUIRED
+from malva.asr.types import ASR_NOT_CONFIGURED
 from malva.audio.capture import TrackSource
 from malva.privacy.manager import PrivacyManager
 from malva.shell.session import MalvaSession, SessionState
@@ -26,23 +26,40 @@ def real_db(tmp_path, monkeypatch):
     return dbmod.get_db()
 
 
+class FakeStream:
+    def __init__(self):
+        self.closed = False
+
+    def push(self, pcm):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
 class FakeASR:
-    language = "auto"
-    is_local = True
+    """Stands in for ASRService. Final/partial text is delivered by the session tests themselves."""
+    model_name = "fake/gemini-test"
 
-    def __init__(self, text="halo", model_used="local"):
+    def __init__(self, text="halo", error=None):
         self.text = text
-        self.model_used = model_used
+        self.error = error          # (code, message) to simulate a blocked or failed transcriber
+        self.streams = []
 
-    def transcribe(self, wav):
-        return ASRResult(full_text=self.text, language="id", model_used=self.model_used)
+    def open_stream(self, label, on_partial, on_final, on_error):
+        if self.error:
+            on_error(*self.error)
+            return None
+        stream = FakeStream()
+        self.streams.append(stream)
+        return stream
 
 
 class FakeDesktop:
     def __init__(self):
         self.calls = []
 
-    def run(self, tool, args):
+    def run(self, tool, args, approved=False):
         self.calls.append((tool, args))
         return {"ok": True, "result": "done", "error": ""}
 
@@ -51,9 +68,9 @@ def _session(mode, db, events, asr=None, desktop=None):
     return MalvaSession(
         mode=mode,
         db=db,
-        asr_router=asr or FakeASR(),
+        asr=asr or FakeASR(),
         desktop=desktop or FakeDesktop(),
-        privacy=PrivacyManager(db=db),
+        privacy=PrivacyManager(),
         on_event=events.append,
     )
 
@@ -62,7 +79,9 @@ def _types(events):
     return [e["type"] for e in events]
 
 
-WAV = b"RIFF-not-really-a-wav"  # _on_utterance never decodes it when ASR is faked
+def _utter(s, source):
+    """One finished speech turn from the cloud transcriber for this source."""
+    s._on_final(s._asr.text, source)
 
 
 # ------------------------------------------------------------------ startup per mode
@@ -159,7 +178,7 @@ def test_processing_always_resolves_back_to_listening(fake_mic_only, real_db):
     s = _session("assistant", real_db, events, asr=FakeASR(text=""))
     s.start()
     try:
-        s._on_utterance(WAV, TrackSource.MICROPHONE, s.session_id)  # empty transcript
+        _utter(s, TrackSource.MICROPHONE)  # empty transcript
         assert s.state == SessionState.LISTENING
         assert [e["state"] for e in events if e["type"] == "state_change"][-1] == SessionState.LISTENING
     finally:
@@ -168,44 +187,54 @@ def test_processing_always_resolves_back_to_listening(fake_mic_only, real_db):
 
 # ------------------------------------------------------------------ speech never acts on its own
 
-def test_speech_proposes_action_but_does_not_execute(fake_mic_only, real_db):
+def test_speech_runs_non_destructive_action_automatically(fake_mic_only, real_db):
     events, desktop = [], FakeDesktop()
     s = _session("assistant", real_db, events, desktop=desktop)
     s.start()
     try:
         s._ai.ask = lambda text, on_chunk=None: ("ketik sesuatu", {"tool": "type_text", "args": {"text": "x"}})
-        s._on_utterance(WAV, TrackSource.MICROPHONE, s.session_id)
-        assert desktop.calls == [], "speech must never run a desktop action by itself"
-        proposed = [e for e in events if e["type"] == "action_proposed"]
-        assert proposed and proposed[0]["action"]["tool"] == "type_text"
-        assert proposed[0]["action"]["origin"] == "speech"
+        _utter(s, TrackSource.MICROPHONE)
+        assert desktop.calls == [("type_text", {"text": "x"})], "tools are auto-granted"
+        assert [e for e in events if e["type"] == "action_proposed"] == []
     finally:
         s.stop()
 
+
+def test_speech_destructive_action_waits_for_approval(fake_mic_only, real_db):
+    events, desktop = [], FakeDesktop()
+    s = _session("assistant", real_db, events, desktop=desktop)
+    s.start()
+    try:
+        s._ai.ask = lambda text, on_chunk=None: ("hapus?", {"tool": "delete_file", "args": {"path": "C:/x.txt"}})
+        _utter(s, TrackSource.MICROPHONE)
+        assert desktop.calls == [], "destructive speech action must wait for approval"
+        proposed = [e for e in events if e["type"] == "action_proposed"]
+        assert proposed and proposed[0]["action"]["tool"] == "delete_file"
+        assert proposed[0]["action"]["origin"] == "speech"
+    finally:
+        s.stop()
 
 def test_approve_runs_pending_action_once(fake_mic_only, real_db):
     events, desktop = [], FakeDesktop()
     s = _session("assistant", real_db, events, desktop=desktop)
     s.start()
     try:
-        pid = s.propose_action("open_url", {"url": "https://example.org"}, origin="speech")
+        pid = s.propose_action("delete_file", {"path": "C:/x.txt"}, origin="speech")
         assert [a["id"] for a in s.pending_actions()] == [pid]
         result = s.approve_action(pid)
         assert result["ok"] is True
-        assert desktop.calls == [("open_url", {"url": "https://example.org"})]
+        assert desktop.calls == [("delete_file", {"path": "C:/x.txt"})]
         assert s.approve_action(pid)["ok"] is False  # cannot run twice
     finally:
         s.stop()
 
-
 def test_reject_discards_without_running(fake_mic_only, real_db):
     desktop = FakeDesktop()
     s = _session("assistant", real_db, [], desktop=desktop)
-    pid = s.propose_action("type_text", {"text": "x"})
+    pid = s.propose_action("delete_file", {"path": "C:/x.txt"})
     s.reject_action(pid)
     assert desktop.calls == []
     assert s.pending_actions() == []
-
 
 def test_typed_instruction_runs_under_normal_policy(fake_mic_only, real_db):
     desktop = FakeDesktop()
@@ -223,7 +252,7 @@ def test_system_audio_is_context_only_in_assistant(fake_mic_only, real_db):
         def boom(*a, **k):
             raise AssertionError("system audio must not trigger an AI prompt")
         s._ai.ask = boom
-        s._on_utterance(WAV, TrackSource.SYSTEM_AUDIO, s.session_id)
+        _utter(s, TrackSource.SYSTEM_AUDIO)
         assert "ai_start" not in _types(events)
     finally:
         s.stop()
@@ -231,20 +260,19 @@ def test_system_audio_is_context_only_in_assistant(fake_mic_only, real_db):
 
 # ------------------------------------------------------------------ ASR failure visibility
 
-def test_missing_local_model_is_reported_and_no_ai_call(fake_mic_only, real_db):
+def test_missing_key_is_reported_and_listening_continues(fake_mic_only, real_db):
+    from malva.asr.service import REASON_MESSAGES
     events = []
-    s = _session("assistant", real_db, events, asr=FakeASR(model_used=LOCAL_MODEL_REQUIRED))
+    s = _session("assistant", real_db, events,
+                 asr=FakeASR(error=(ASR_NOT_CONFIGURED, REASON_MESSAGES[ASR_NOT_CONFIGURED])))
     s.start()
     try:
-        s._ai.ask = lambda *a, **k: (_ for _ in ()).throw(AssertionError("no AI call expected"))
-        s._on_utterance(WAV, TrackSource.MICROPHONE, s.session_id)
         asr_errors = [e for e in events if e["type"] == "asr_error"]
-        assert asr_errors and asr_errors[0]["code"] == LOCAL_MODEL_REQUIRED
-        assert "tidak dikirim ke cloud" in asr_errors[0]["message"]
+        assert asr_errors and asr_errors[0]["code"] == ASR_NOT_CONFIGURED
+        assert "GEMINI_API_KEY" in asr_errors[0]["message"]
         assert s.state == SessionState.LISTENING
     finally:
         s.stop()
-
 
 # ------------------------------------------------------------------ interview practice flow
 
@@ -253,7 +281,7 @@ def test_practice_ignores_speech_until_a_question_is_asked(fake_mic_only, real_d
     s = _session("interview_practice", real_db, events)
     s.start()
     try:
-        s._on_utterance(WAV, TrackSource.MICROPHONE, s.session_id)
+        _utter(s, TrackSource.MICROPHONE)
         assert "interview_answer_draft" not in _types(events)
     finally:
         s.stop()
@@ -270,7 +298,7 @@ def test_practice_flow_is_explicit_start_answer_evaluate(fake_mic_only, real_db)
         assert q == "Ceritakan tantangan terbesar Anda."
         assert any(e["type"] == "interview_question" for e in events)
 
-        s._on_utterance(WAV, TrackSource.MICROPHONE, s.session_id)
+        _utter(s, TrackSource.MICROPHONE)
         assert any(e["type"] == "interview_answer_draft" for e in events)
         assert not any(e["type"] == "interview_feedback" for e in events), "speech must not auto-evaluate"
 
@@ -329,63 +357,21 @@ def test_live_partial_is_shown_but_never_stored(fake_mic_only, real_db):
     s = _session("assistant", real_db, events, asr=FakeASR("sedang bicara"))
     s.start()
     try:
-        s._on_partial(b"wav", TrackSource.MICROPHONE, s.session_id)
+        s._on_partial("sedang bicara", TrackSource.MICROPHONE)
         evt = _wait_for_event(events, "transcript_partial", "sedang bicara")
         assert evt is not None and evt["source"] == "microphone"
         assert "transcript_segment" not in _types(events)
     finally:
         s.stop()
 
-
-def test_partial_is_dropped_while_a_final_is_in_flight(fake_mic_only, real_db):
-    import time as _t
-    events = []
-    s = _session("assistant", real_db, events, asr=FakeASR("tidak tampil"))
-    s.start()
-    try:
-        s._final_inflight = 1
-        s._on_partial(b"wav", TrackSource.MICROPHONE, s.session_id)
-        _t.sleep(0.3)
-        assert _wait_for_event(events, "transcript_partial", "tidak tampil", timeout=0.1) is None
-        s._final_inflight = 0
-    finally:
-        s.stop()
-
-
-def test_partial_never_uses_cloud_asr(fake_mic_only, real_db):
-    import time as _t
-
-    class CloudOnlyASR(FakeASR):
-        is_local = False
-
-        def __init__(self):
-            super().__init__("x")
-            self.calls = 0
-
-        def transcribe(self, wav):
-            self.calls += 1
-            return super().transcribe(wav)
-
-    events, asr = [], CloudOnlyASR()
-    s = _session("assistant", real_db, events, asr=asr)
-    s.start()
-    try:
-        s._on_partial(b"wav", TrackSource.MICROPHONE, s.session_id)
-        _t.sleep(0.3)
-        assert asr.calls == 0
-    finally:
-        s.stop()
-
-
 def test_final_utterance_clears_live_text(fake_mic_only, real_db):
     events = []
     s = _session("voice_input", real_db, events, asr=FakeASR("kalimat akhir"))
     s.start()
     try:
-        s._on_utterance(b"wav", TrackSource.MICROPHONE, s.session_id)
+        _utter(s, TrackSource.MICROPHONE)
         assert _wait_for_event(events, "voice_input_text", "kalimat akhir") is not None
         clears = [e for e in events if e.get("type") == "transcript_partial" and e.get("text") == ""]
         assert clears, "the final result must clear the live line"
-        assert s._final_inflight == 0
     finally:
         s.stop()

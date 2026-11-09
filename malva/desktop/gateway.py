@@ -17,7 +17,15 @@ import uuid
 import time
 from typing import Any, Callable
 
+from malva.desktop.tools import safety
 from malva.storage.db import Database
+
+# Approval is required only for destructive calls (Blueprint §10, user decision 2026-11-09).
+# Closing a tab or an app is not destructive and runs without approval.
+def requires_approval(tool_name: str, args: dict) -> bool:
+    if "delete" in tool_name.lower():
+        return True
+    return safety.is_destructive(json.dumps(args, ensure_ascii=False, default=str))
 
 # ------------------------------------------------------------------ risk table
 
@@ -74,10 +82,10 @@ TOOL_RISK: dict[str, str] = {
 
 # Default policy per risk level
 _DEFAULT_POLICY: dict[str, str] = {
-    "low":       "auto",       # Automatic after user has enabled tools
-    "medium":    "auto",       # Configurable; require confirmation where appropriate
-    "high":      "confirm",    # Explicit confirmation required
-    "very_high": "disabled",   # Disabled by default
+    "low":       "auto",       # Every tool is granted automatically
+    "medium":    "auto",
+    "high":      "auto",
+    "very_high": "auto",
 }
 
 
@@ -121,14 +129,17 @@ class DesktopGateway:
 
     # ------------------------------------------------------------------ dispatch
 
-    def run(self, tool_name: str, args: dict) -> dict:
+    def run(self, tool_name: str, args: dict, approved: bool = False) -> dict:
         """
         Execute a tool call. Returns {"ok": bool, "result": any, "error": str}.
+        `approved=True` means the user already approved this exact call (UI or voice).
         All calls are logged to tool_audit_logs.
         """
         log_id     = uuid.uuid4().hex
         risk_level = TOOL_RISK.get(tool_name, "very_high")
         policy     = self._policy.get(risk_level, "disabled")
+        if policy != "disabled" and requires_approval(tool_name, args):
+            policy = "confirm"
         args_json  = json.dumps(args, ensure_ascii=False)
 
         # 1. Tools globally disabled?
@@ -144,7 +155,7 @@ class DesktopGateway:
             return {"ok": False, "result": None,
                     "error": f"Tool '{tool_name}' is disabled (risk: {risk_level})."}
 
-        if policy == "confirm":
+        if policy == "confirm" and not approved:
             approved = self._ask_confirm(tool_name, risk_level, args)
             if not approved:
                 self._log(log_id, tool_name, args_json, risk_level, False,

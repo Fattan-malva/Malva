@@ -65,7 +65,7 @@ def test_system_audio_without_loopback_does_not_open_microphone(fake_mic_only):
     capture = fake_mic_only
     from malva.audio.capture import AudioTrack, TrackSource
 
-    track = AudioTrack(TrackSource.SYSTEM_AUDIO, "s1", on_utterance=lambda *a: None)
+    track = AudioTrack(TrackSource.SYSTEM_AUDIO, "s1", on_pcm=lambda *a: None)
     with pytest.raises(AudioDeviceError) as exc:
         track.start()
     assert exc.value.code == ERR_LOOPBACK_UNAVAILABLE
@@ -78,7 +78,7 @@ def test_microphone_track_opens_and_stops_cleanly(fake_mic_only):
     capture = fake_mic_only
     from malva.audio.capture import AudioTrack, TrackSource
 
-    track = AudioTrack(TrackSource.MICROPHONE, "s1", on_utterance=lambda *a: None)
+    track = AudioTrack(TrackSource.MICROPHONE, "s1", on_pcm=lambda *a: None)
     track.start()
     try:
         assert track.is_active
@@ -99,7 +99,7 @@ def test_open_failure_on_every_rate_is_reported(monkeypatch):
         "PyAudio": staticmethod(lambda: failing), "paInt16": 8}))
 
     from malva.audio.capture import AudioTrack, TrackSource
-    track = AudioTrack(TrackSource.MICROPHONE, "s1", on_utterance=lambda *a: None)
+    track = AudioTrack(TrackSource.MICROPHONE, "s1", on_pcm=lambda *a: None)
     with pytest.raises(AudioDeviceError) as exc:
         track.start()
     assert exc.value.code == "OPEN_FAILED"
@@ -115,7 +115,7 @@ def test_stereo_loopback_is_opened_with_real_device_format(monkeypatch):
     monkeypatch.setattr(capture, "_HAS_WPATCH", True)
 
     from malva.audio.capture import AudioTrack, TrackSource
-    track = AudioTrack(TrackSource.SYSTEM_AUDIO, "s1", on_utterance=lambda *a: None)
+    track = AudioTrack(TrackSource.SYSTEM_AUDIO, "s1", on_pcm=lambda *a: None)
     track.start()
     try:
         assert pa_wp.opened[0]["device"] == 9
@@ -132,7 +132,7 @@ def test_engine_never_creates_duplicate_track(fake_mic_only):
     capture = fake_mic_only
     from malva.audio.capture import AudioEngine, TrackSource
 
-    engine = AudioEngine("s1", "assistant", on_utterance=lambda *a: None)
+    engine = AudioEngine("s1", "assistant", on_pcm=lambda *a: None)
     first = engine.start_microphone()
     second = engine.start_microphone()
     try:
@@ -146,7 +146,7 @@ def test_engine_never_creates_duplicate_track(fake_mic_only):
 def test_voice_input_rejects_system_audio_at_engine_level(fake_mic_only):
     from malva.audio.capture import AudioEngine
 
-    engine = AudioEngine("s1", "voice_input", on_utterance=lambda *a: None)
+    engine = AudioEngine("s1", "voice_input", on_pcm=lambda *a: None)
     with pytest.raises(ValueError):
         engine.start_system_audio()
     assert all(not pa.opened for pa in FakePA.instances)
@@ -157,7 +157,7 @@ def test_levels_are_tagged_with_source(fake_mic_only):
     from malva.audio.capture import AudioEngine, TrackSource
 
     seen = []
-    engine = AudioEngine("s1", "assistant", on_utterance=lambda *a: None,
+    engine = AudioEngine("s1", "assistant", on_pcm=lambda *a: None,
                          on_levels=lambda src, lv: seen.append((src, lv)))
     engine.start_microphone()
     deadline = time.time() + 2.0
@@ -170,16 +170,18 @@ def test_levels_are_tagged_with_source(fake_mic_only):
     assert len(levels) == 5 and all(0.0 <= v <= 1.0 for v in levels)
 
 
-def test_live_text_decodes_only_the_recent_window():
-    """Partial passes must not re-decode the whole utterance: cost would grow with every second."""
+def test_pcm_is_resampled_to_16k_for_the_transcriber():
+    """The cloud transcriber takes 16 kHz mono PCM. Device rates (44.1/48 kHz) must be converted."""
+    import numpy as np
     from malva.audio import capture as cap
     from malva.audio.capture import AudioTrack, TrackSource
 
-    seen = []
-    track = AudioTrack(TrackSource.MICROPHONE, "s1", on_utterance=lambda *a: None,
-                       on_partial=lambda wav, t: seen.append(wav))
-    frames = [b"\x00\x00" * cap.CHUNK] * 400  # about 25 s of speech
-    track._emit_partial(frames)
-    window = int(cap.PARTIAL_WINDOW_SECONDS * track.sample_rate / cap.CHUNK)
-    expected = AudioTrack._frames_to_wav(frames[-window:], track.sample_rate)
-    assert len(seen) == 1 and len(seen[0]) == len(expected)
+    track = AudioTrack(TrackSource.SYSTEM_AUDIO, "s1", on_pcm=lambda *a: None)
+    mono = np.zeros(1024, dtype=np.int16)
+
+    track.sample_rate = 48000
+    resampled = np.frombuffer(track._to_target_rate(mono), dtype=np.int16)
+    assert abs(resampled.size - 1024 / 3) <= 1
+
+    track.sample_rate = cap.TARGET_RATE
+    assert np.frombuffer(track._to_target_rate(mono), dtype=np.int16).size == 1024

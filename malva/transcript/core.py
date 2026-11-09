@@ -17,7 +17,7 @@ import time
 import uuid
 from typing import Callable
 
-from malva.asr.router import ASRResult, ASRSegment
+from malva.asr.types import ASRResult, ASRSegment
 from malva.storage.db import Database
 
 
@@ -36,7 +36,7 @@ class TranscriptCore:
     def ingest(self, result: ASRResult, track_id: str = "", source_type: str = "") -> list[dict]:
         """
         Store an ASRResult. Returns list of event dicts emitted.
-        Called by the ASR pipeline after each utterance is finalized.
+        Called by the ASR pipeline after each finished speech turn.
         """
         events: list[dict] = []
         if not result.full_text.strip():

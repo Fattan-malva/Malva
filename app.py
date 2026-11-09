@@ -45,7 +45,8 @@ LOG_PATH = _setup_diagnostics()
 
 import webview
 
-from malva.asr.router import ASRRouter
+from malva.asr.gemini_live import MODEL_DEFAULT
+from malva.asr.service import ASRService
 from malva.audio.capture import TrackSource
 from malva.desktop.gateway import DesktopGateway
 from malva.privacy.manager import PrivacyManager
@@ -135,24 +136,15 @@ class MalvaAPI:
     def get_privacy_status(self) -> dict:
         return self._app.privacy.get_status()
 
-    def set_cloud_processing(self, enabled: bool) -> dict:
-        self._app.privacy.set_cloud_processing(bool(enabled))
-        self._app.sync_asr_status()
-        return self._app.privacy.get_status()
 
     # --- ASR
     def set_asr_language(self, lang: str) -> None:
         if lang not in ("auto", "id", "en"):
             return
         self._app.database.set_setting("asr_language", lang)
-        self._app.asr_router.language = lang
         self._app.sync_asr_status()
-
-    def get_asr_catalog(self) -> list[dict]:
-        return self._app.asr_router.get_models_catalog()
-
-    def download_and_load_model(self, model_size: str) -> None:
-        self._app.asr_router.load_model_async(model_size)
+        # Reconnect the transcribers so the new language applies to live audio.
+        threading.Thread(target=self._app.session.refresh_asr_streams, daemon=True).start()
 
     # --- chat / assistant
     def send_text(self, text: str) -> None:
@@ -189,22 +181,18 @@ class MalvaApp:
         db.init(DB_PATH)
         self.database = db.get_db()
 
-        self.privacy = PrivacyManager(on_status_change=self._on_privacy_status, db=self.database)
-        _web_backend.set_cloud_gate(lambda: self.privacy.cloud_processing)
+        self.privacy = PrivacyManager(on_status_change=self._on_privacy_status)
+        _web_backend.set_cloud_gate(self.privacy.allows_cloud)
 
         tools_enabled = os.getenv("TOOLS_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
         self.desktop = DesktopGateway(session_id="", db=self.database, tools_enabled=tools_enabled)
 
-        saved_lang = self.database.get_setting("asr_language", DEFAULT_ASR_LANGUAGE)
-        self.asr_router = ASRRouter(
-            model_size="small",
-            device="cpu",
-            compute_type="int8",
-            language=saved_lang,
-            auto_load=True,
-            privacy_manager=self.privacy,
+        self.asr = ASRService(
+            privacy=self.privacy,
+            api_key=os.getenv("GEMINI_API_KEY", ""),
+            model=os.getenv("GEMINI_ASR_MODEL", MODEL_DEFAULT),
+            language_getter=lambda: self.database.get_setting("asr_language", DEFAULT_ASR_LANGUAGE),
         )
-        self.asr_router.set_status_callback(self._on_asr_status_update)
 
         # Focus is an app-level preference, persisted across restarts and mode switches.
         self.focus_mode = self.database.get_setting("focus_mode", "0") == "1"
@@ -245,7 +233,7 @@ class MalvaApp:
         self.session = MalvaSession(
             mode=mode,
             db=self.database,
-            asr_router=self.asr_router,
+            asr=self.asr,
             desktop=self.desktop,
             privacy=self.privacy,
             on_event=self._on_session_event,
@@ -257,7 +245,7 @@ class MalvaApp:
         if self._is_sleeping:
             self.wake()
         self._create_session(mode)
-        self.session.start()
+        threading.Thread(target=self._start_session_worker, daemon=True, name="session-switch").start()
         self._call("updateMode", mode)
         self._call("updateFocusMode", self.focus_mode)
 
@@ -350,12 +338,7 @@ class MalvaApp:
     def _on_privacy_status(self, component: str, status: str) -> None:
         if component == "hidden_mode":
             self._call("updateHiddenMode", status)
-        elif component == "cloud_processing":
-            self._call("updatePrivacy", self.privacy.get_status())
 
-    def _on_asr_status_update(self, data: dict) -> None:
-        self._call("onASRStatusUpdate", data)
-        self.sync_asr_status()
 
     # ------------------------------------------------------------------ interactions
 
@@ -423,7 +406,7 @@ class MalvaApp:
     # ------------------------------------------------------------------ sync helpers
 
     def sync_asr_status(self) -> None:
-        payload = {"info": self.asr_router.model_info, "catalog": self.asr_router.get_models_catalog()}
+        payload = {"info": self.asr.status()}
         self._call("updateASRStatus", payload)
 
     def _apply_native_styling(self) -> None:
@@ -452,10 +435,19 @@ class MalvaApp:
         self._call("updateFocusMode", self.focus_mode)
         self._call("updatePrivacy", self.privacy.get_status())
         self.sync_asr_status()
-        self.session.start()
+        # Opening audio devices can take seconds. Doing it here would block the bridge
+        # thread and freeze the UI, so the session starts in the background.
+        threading.Thread(target=self._start_session_worker, daemon=True, name="session-start").start()
 
         self._idle_thread = threading.Thread(target=self._idle_monitor, daemon=True)
         self._idle_thread.start()
+
+    def _start_session_worker(self) -> None:
+        try:
+            self.session.start()
+        except Exception as e:
+            print(f"[app] session start failed: {e}")
+            self._call("showNotice", "error", f"Sesi gagal dimulai: {e}")
 
     def get_hwnd(self) -> int | None:
         if self.window:

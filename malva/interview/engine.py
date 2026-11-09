@@ -188,7 +188,7 @@ class InterviewEngine:
 
         summary    = self._ai.summarize_transcript(transcript_text, task="interview_notes")
         if not summary.strip():
-            summary = "(Ringkasan AI tidak tersedia. AI memakai Ollama cloud: atur OLLAMA_URL dan aktifkan cloud di Setelan.)"
+            summary = "(Ringkasan AI tidak tersedia. AI memakai Ollama cloud: atur OLLAMA_URL dan pastikan CLOUD_ENABLED tidak false.)"
         follow_ups = self._generate_follow_ups(transcript_text)
 
         report = {

@@ -76,8 +76,24 @@ Malva has three product foundations:
 
   ASR language setting                Auto and Manual
 
-  ASR direction                       Multilingual, local-first,
-                                      model-router architecture
+  ASR direction                       Cloud speech recognition
+                                      (Gemini Live transcription). No
+                                      local models. Free tier during the
+                                      test phase.
+
+  Cloud processing                    Approved for every service: speech
+                                      (Gemini), LLM (Ollama cloud), and
+                                      web search. Controlled by the
+                                      CLOUD_ENABLED setting, not by an
+                                      in-app opt-in. Revisit before
+                                      production (free-tier data use).
+
+  Tool permissions                    All Windows-MCP tools are granted
+                                      automatically. Only destructive
+                                      actions (delete) need approval,
+                                      given by a click or by a spoken
+                                      phrase from the microphone. Closing
+                                      a tab or an app is not destructive.
 
   Desktop integration                 Windows-MCP as a separately managed
                                       integration
@@ -333,23 +349,40 @@ Each track should preserve, where applicable:
 
 ## 9. ASR architecture
 
-Use an **ASR Model Router** instead of hard-coding one recognition model
-into the application.
+Speech recognition runs in the cloud with the **Gemini Live API**, model
+`gemini-3.5-transcribe-live`. Malva has no local recognition model.
 
-### Candidate models
+-   Each audio source (microphone, system audio) has its own stream, so
+    the two tracks are never mixed.
+-   Audio is sent as 16-bit PCM, 16 kHz, mono (`audio/pcm;rate=16000`).
+    Device audio at other rates is resampled before sending.
+-   The model runs with `response_modalities=["TEXT"]`, so it does not
+    generate spoken replies.
+-   `interim_input_transcription` gives live partial text while someone
+    speaks. It is shown but not stored.
+-   `input_transcription` gives the final text of one speech turn. Only
+    final text enters the transcript store and goes to the AI.
+-   A streaming session lasts at most 10 minutes. Malva reconnects before
+    that limit (after 9 minutes). Audio captured during a reconnect is
+    queued and sent when the connection is back. If the network stalls,
+    the oldest audio is dropped and counted.
+-   Speech activity (a simple level threshold) only resets the auto-sleep
+    timer. It does not segment the audio.
 
-1.  **Qwen3-ASR** --- primary candidate for evaluation, including
-    Indonesian and English support. Evaluate the available model sizes
-    and runtime options on target Windows hardware.
-2.  **Whisper large-v3 / large-v3-turbo** --- multilingual comparison
-    and potential fallback candidate.
-3.  Additional models may be evaluated later if they provide a
-    meaningful advantage in latency, accuracy, memory use, language
-    coverage, or streaming behavior.
+Verified against the Gemini Live transcription documentation. Limits for
+the free tier are not stated on that page and must be checked in AI Studio
+before production use.
 
-These are candidates, not guaranteed performance choices. Do not claim a
-specific latency or accuracy until benchmarks have been run on
-representative hardware and audio.
+Speech that reaches the cloud is covered by the product decision in §3.
+A missing `GEMINI_API_KEY` or `CLOUD_ENABLED=false` stops transcription,
+and the user is told which one applies. Nothing falls back to another
+service.
+
+### Candidate models (historical)
+
+Earlier drafts evaluated Qwen3-ASR and local Whisper models. Both were
+removed when the design moved to cloud recognition. They are kept here
+only as reference for future benchmarks.
 
 ### Language settings
 
@@ -398,7 +431,8 @@ contract.
 -   Custom vocabulary for names, acronyms, and technical terms.
 -   Confidence or uncertainty markers where available.
 -   Chunking/buffering controls where useful.
--   Local model download and update management.
+-   `GEMINI_API_KEY` and `GEMINI_ASR_MODEL` in `.env`.
+-   `CLOUD_ENABLED` (default `true`) as the single cloud switch.
 
 ### Benchmark requirements
 
@@ -441,26 +475,27 @@ flowchart TD
 
 ### Risk-based permissions
 
+Every tool is granted automatically. Approval is needed only for an
+action that deletes something. The check looks at the tool name and the
+arguments, so a delete hidden in a command or in typed text is also caught.
+
   -----------------------------------------------------------------------
-  Risk                    Examples                Default policy
-  ----------------------- ----------------------- -----------------------
-  Low                     Read window title,      May be automatic after
-                          inspect permitted       user permission
-                          screen context          
-
-  Medium                  Click, type, scroll,    Configurable; require
-                          fill fields             confirmation where
-                                                  appropriate
-
-  High                    Send email, delete      Explicit confirmation
-                          files, change important 
-                          settings                
-
-  Very high               Arbitrary PowerShell,   Disabled by default
-                          registry edits,         
-                          administrative          
-                          operations              
+  Action                                  Policy
+  --------------------------------------- -------------------------------
+  Any tool, including close tab or app    Automatic
+  Anything that deletes files or data     Approval required: click in
+                                          the panel, or say "setuju" /
+                                          "ya hapus" (cancel: "batal")
   -----------------------------------------------------------------------
+
+Voice approval rules:
+
+-   Only the microphone can approve. System audio never approves.
+-   The whole utterance must be one approval phrase. A sentence that
+    contains the word does not count.
+-   Only a pending destructive action can be approved, and only within
+    120 seconds of being proposed. The newest pending action is the one
+    approved.
 
 Run Windows-MCP as a separate process or service where practical. This
 reduces dependency and runtime coupling with the desktop application and
@@ -498,8 +533,8 @@ Teams, recorder, remote-desktop path, or external camera.
 
 ### Privacy settings
 
--   Local-only processing option.
--   Cloud processing is opt-in.
+-   Cloud processing is approved for speech, LLM, and web search (§3),
+    and is switched with `CLOUD_ENABLED`.
 -   Per-application audio allow/deny rules where supported.
 -   Configurable transcript and audio retention.
 -   Delete session and related data.
@@ -674,7 +709,7 @@ flowchart TB
 ### Phase 2 --- Voice Intelligence
 
 -   Implement ASR Model Router.
--   Benchmark Qwen3-ASR and Whisper candidates.
+-   Benchmark Gemini Live transcription on representative Indonesian and English audio.
 -   Add Auto and Manual language settings.
 -   Add live transcription.
 -   Add transcript storage and source metadata.
@@ -758,10 +793,6 @@ dependencies.
     https://github.com/CursorTouch/Windows-MCP
 -   **OpenWhispr (voice/transcription reference):**
     https://github.com/OpenWhispr/openwhispr
--   **Qwen3-ASR (multilingual ASR candidate):**
-    https://github.com/QwenLM/Qwen3-ASR
--   **Whisper (ASR reference implementation):**
-    https://github.com/openai/whisper
 
 ### Design quality and anti-AI-slop references
 
@@ -811,12 +842,14 @@ When using this blueprint as project context:
     invisibility.
 7.  Do not merge microphone and system audio into one indistinguishable
     track.
-8.  Do not silently enable cloud processing or consequential desktop
-    actions.
+8.  Do not add cloud calls or destructive desktop capabilities that are
+    not listed in §3 and §10. Cloud and approval rules are product
+    decisions and must be changed here first.
 9.  Keep original transcripts and AI-generated outputs separate.
 10. Propose changes in small, testable phases.
 11. When making a technical claim that depends on a library or API
-    version, verify it against current upstream documentation.
+    version, verify it against current upstream documentation. The
+    Gemini Live transcription page is the reference for §9.
 12. If a requirement conflicts with the existing repository or platform
     limitations, explain the conflict and propose alternatives instead
     of silently ignoring the requirement.

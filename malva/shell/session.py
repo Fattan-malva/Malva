@@ -3,7 +3,8 @@ malva.shell.session — Session lifecycle manager.
 
 Each session:
   - Has a mode (assistant | meeting | interview_practice | interview_notes | voice_input)
-  - Owns an AudioEngine, ASRRouter, TranscriptCore, AIOrchestrator, and mode engine
+  - Owns an AudioEngine, one streaming transcriber per source, TranscriptCore,
+    AIOrchestrator, and mode engine
   - Emits canonical events to the UI (see EVENT_TYPES below)
 
 Behaviour guarantees:
@@ -27,14 +28,18 @@ import time
 import uuid
 from typing import Callable
 
-from malva.asr.router import LOCAL_FAILED, LOCAL_MODEL_REQUIRED, ASRRouter
+from malva.asr.gemini_live import GeminiLiveStream, language_codes_for
+from malva.asr.service import ASRService
+from malva.asr.types import ASRResult, ASRSegment
 from malva.audio.capture import AudioEngine, TrackSource
 from malva.audio.devices import AudioDeviceError
 from malva.ai.orchestrator import AIOrchestrator
 from malva.desktop.gateway import DesktopGateway
 from malva.interview.engine import InterviewEngine
 from malva.meeting.engine import MeetingEngine
+from malva.desktop.gateway import requires_approval
 from malva.privacy.manager import PrivacyManager
+from malva.shell.policy import VOICE_APPROVAL_WINDOW_SECONDS, voice_decision
 from malva.storage.db import Database
 from malva.transcript.core import TranscriptCore
 
@@ -82,7 +87,7 @@ class MalvaSession:
         self,
         mode: str,
         db: Database,
-        asr_router: ASRRouter,
+        asr: ASRService,
         desktop: DesktopGateway,
         privacy: PrivacyManager,
         on_event: Callable[[dict], None],
@@ -93,7 +98,7 @@ class MalvaSession:
         self.session_id = uuid.uuid4().hex
         self.mode       = mode
         self._db        = db
-        self._asr       = asr_router
+        self._asr       = asr
         self._desktop   = desktop
         self._privacy   = privacy
         self._on_event  = on_event
@@ -112,16 +117,15 @@ class MalvaSession:
         self._practice_question = ""
         self._practice_answer: list[str] = []
 
-        # Finals always win over live text: partial passes are skipped while any final is in flight.
-        self._inflight_lock = threading.Lock()
-        self._final_inflight = 0
-        self._partial_guard = threading.Lock()
+        # One streaming transcriber per audio source (see malva/asr/gemini_live.py).
+        self._streams: dict[TrackSource, GeminiLiveStream] = {}
+        self._streams_lock = threading.Lock()
 
         self._audio = AudioEngine(
             session_id=self.session_id,
             mode=mode,
-            on_utterance=self._on_utterance,
-            on_partial=self._on_partial,
+            on_pcm=self._on_pcm,
+            on_speech=self._on_speech,
             on_levels=self._on_audio_levels,
             on_error=self._on_capture_error,
             db=db,
@@ -181,6 +185,7 @@ class MalvaSession:
             self._running = False
             self._paused = False
             self._sleeping = False
+        self._close_all_streams()
         self._audio.stop_all()
         self._set_state(SessionState.IDLE)
         try:
@@ -209,6 +214,7 @@ class MalvaSession:
                 self._audio.start_microphone()
             else:
                 self._audio.start_system_audio()
+            self._open_stream(source)
             return True
         except AudioDeviceError as e:
             self._emit({"type": "capture_error", "source": source.value,
@@ -228,6 +234,7 @@ class MalvaSession:
         return ok
 
     def disable_source(self, source: TrackSource) -> None:
+        self._close_stream(source)
         self._audio.stop_track(source)
         self._emit_source_states()
         if self._running and not self._audio.active_sources:
@@ -329,10 +336,18 @@ class MalvaSession:
     # ------------------------------------------------------------------ pending actions
 
     def propose_action(self, tool: str, args: dict, origin: str = "speech") -> str:
+        """Non-destructive actions run at once (tools are auto-granted). Destructive ones wait for approval."""
         pid = uuid.uuid4().hex[:12]
+        if not requires_approval(tool, args):
+            result = self._desktop.run(tool, args)
+            self._emit({"type": "action_result", "id": pid, "ok": bool(result.get("ok")),
+                        "message": str(result.get("error") or "Selesai")})
+            return pid
         with self._lock:
-            self._pending[pid] = {"id": pid, "tool": tool, "args": args, "origin": origin}
-        self._emit({"type": "action_proposed", "action": dict(self._pending[pid])})
+            self._pending[pid] = {"id": pid, "tool": tool, "args": args, "origin": origin,
+                                  "created_at": time.time()}
+        self._emit({"type": "action_proposed", "action": {k: v for k, v in self._pending[pid].items()
+                                                          if k != "created_at"}})
         return pid
 
     def pending_actions(self) -> list[dict]:
@@ -344,10 +359,29 @@ class MalvaSession:
             action = self._pending.pop(action_id, None)
         if action is None:
             return {"ok": False, "error": "Aksi tidak ditemukan atau sudah diproses."}
-        result = self._desktop.run(action["tool"], action.get("args", {}))
+        result = self._desktop.run(action["tool"], action.get("args", {}), approved=True)
         self._emit({"type": "action_result", "id": action_id, "ok": bool(result.get("ok")),
                     "message": str(result.get("error") or "Selesai")})
         return result
+
+    def _handle_voice_decision(self, text: str) -> bool:
+        """Approve or reject the newest pending destructive action by voice. Microphone only."""
+        decision = voice_decision(text)
+        if decision is None:
+            return False
+        now = time.time()
+        with self._lock:
+            candidates = [a for a in self._pending.values()
+                          if requires_approval(a["tool"], a.get("args", {}))
+                          and now - a.get("created_at", 0) <= VOICE_APPROVAL_WINDOW_SECONDS]
+        if not candidates:
+            return False
+        target = max(candidates, key=lambda a: a["created_at"])["id"]
+        if decision == "approve":
+            self.approve_action(target)
+        else:
+            self.reject_action(target)
+        return True
 
     def reject_action(self, action_id: str) -> None:
         with self._lock:
@@ -399,7 +433,7 @@ class MalvaSession:
         if question:
             self._practice_question = question
         else:
-            self._emit({"type": "notice", "message": "Pertanyaan belum bisa dibuat. Periksa AI cloud (OLLAMA_URL) dan opt-in di Setelan."})
+            self._emit({"type": "notice", "message": "Pertanyaan belum bisa dibuat. Periksa AI cloud (OLLAMA_URL) dan CLOUD_ENABLED di .env."})
         return question
 
     def finish_practice(self) -> None:
@@ -410,26 +444,82 @@ class MalvaSession:
 
     # ------------------------------------------------------------------ pipeline
 
-    def _on_utterance(self, wav_bytes: bytes, source: TrackSource, session_id: str) -> None:
-        """Called by AudioEngine for each finished utterance (worker thread)."""
+    # ------------------------------------------------------------------ streaming transcription
+
+    def _open_stream(self, source: TrackSource) -> None:
+        """Start (or restart) the cloud transcriber for one source."""
+        self._close_stream(source)
+        stream = self._asr.open_stream(
+            label=source.value,
+            on_partial=lambda text: self._on_partial(text, source),
+            on_final=lambda text: self._on_final(text, source),
+            on_error=lambda code, message: self._on_asr_error(code, message),
+        )
+        if stream is not None:
+            with self._streams_lock:
+                self._streams[source] = stream
+
+    def _close_stream(self, source: TrackSource) -> None:
+        with self._streams_lock:
+            stream = self._streams.pop(source, None)
+        if stream is not None:
+            stream.close()
+
+    def _close_all_streams(self) -> None:
+        with self._streams_lock:
+            streams = list(self._streams.values())
+            self._streams.clear()
+        for stream in streams:
+            stream.close()
+
+    def refresh_asr_streams(self) -> None:
+        """Reopen every active transcriber so a changed language setting takes effect."""
+        if not self._running:
+            return
+        for source in self._audio.active_sources:
+            self._open_stream(source)
+
+    def _on_pcm(self, pcm: bytes, source: TrackSource, session_id: str) -> None:
+        """16 kHz PCM from the capture thread. Forwarded only while listening."""
         if not self._running or self._paused or self._sleeping:
             return
-        with self._inflight_lock:
-            self._final_inflight += 1
+        with self._streams_lock:
+            stream = self._streams.get(source)
+        if stream is not None:
+            stream.push(pcm)
+
+    def _on_speech(self, source: TrackSource) -> None:
+        """Speech activity keeps the session awake. Voice itself is not stored here."""
+        if self._running and not self._paused and not self._sleeping:
+            self.touch()
+
+    def _on_partial(self, text: str, source: TrackSource) -> None:
+        """Live text while someone is still speaking. Shown only; never stored or sent to AI."""
+        if not self._running or self._paused or self._sleeping:
+            return
+        self._emit({"type": "transcript_partial", "source": source.value, "text": text})
+
+    def _primary_language(self) -> str:
+        codes = language_codes_for(self._db.get_setting("asr_language", DEFAULT_ASR_LANGUAGE))
+        return codes[0].split("-")[0] if codes else "und"
+
+    def _on_final(self, text: str, source: TrackSource) -> None:
+        """One finished speech turn from the cloud transcriber (stream thread)."""
+        text = (text or "").strip()
+        if not text or not self._running or self._paused or self._sleeping:
+            return
         self._set_state(SessionState.PROCESSING)
         try:
             self.touch()
-            self._asr.language = self._db.get_setting("asr_language", DEFAULT_ASR_LANGUAGE)
-            result = self._asr.transcribe(wav_bytes)
-
-            if result.model_used in (LOCAL_MODEL_REQUIRED, LOCAL_FAILED):
-                self._asr_problem(result.model_used)
-                return
-
-            text = result.full_text.strip()
-            if not text:
-                return
-
+            if source == TrackSource.MICROPHONE and self._handle_voice_decision(text):
+                return  # the user's own voice answered a pending approval
+            language = self._primary_language()
+            result = ASRResult(
+                full_text=text,
+                language=language,
+                segments=[ASRSegment(text=text, language=language)],
+                model_used=self._asr.model_name,
+            )
             track = self._audio.get_track(source)
             track_id = track.track_id if track else ""
             self._transcript.ingest(result, track_id=track_id, source_type=source.value)
@@ -456,48 +546,7 @@ class MalvaSession:
                 self.propose_action(action["tool"], action.get("args", {}), origin="speech")
         finally:
             self._emit({"type": "transcript_partial", "source": source.value, "text": ""})
-            with self._inflight_lock:
-                self._final_inflight -= 1
             self._restore_state()
-
-    def _on_partial(self, wav_bytes: bytes, source: TrackSource, session_id: str) -> None:
-        """Live text while someone is still speaking (called from the capture thread).
-
-        Local model only: partial passes never go to cloud ASR and never reach the
-        transcript store. They are skipped while a final transcription is running or
-        another partial is in progress, so live text cannot delay the final result.
-        """
-        if not self._running or self._paused or self._sleeping:
-            return
-        if not self._asr.is_local:
-            return
-        with self._inflight_lock:
-            if self._final_inflight:
-                return
-        if not self._partial_guard.acquire(blocking=False):
-            return
-        try:
-            threading.Thread(target=self._run_partial, args=(wav_bytes, source),
-                             daemon=True, name="malva-partial").start()
-        except Exception:
-            self._partial_guard.release()
-            raise
-
-    def _run_partial(self, wav_bytes: bytes, source: TrackSource) -> None:
-        try:
-            self._asr.language = self._db.get_setting("asr_language", DEFAULT_ASR_LANGUAGE)
-            result = self._asr.transcribe(wav_bytes)
-            text = (result.full_text or "").strip()
-            if not text or result.model_used in (LOCAL_MODEL_REQUIRED, LOCAL_FAILED):
-                return
-            with self._inflight_lock:
-                if self._final_inflight or not self._running or self._paused or self._sleeping:
-                    return
-            self._emit({"type": "transcript_partial", "source": source.value, "text": text})
-        except Exception as e:
-            print(f"[asr] partial transcription failed: {e}")
-        finally:
-            self._partial_guard.release()
 
     def _restore_state(self) -> None:
         if not self._running:
@@ -516,16 +565,12 @@ class MalvaSession:
         self.state = state
         self._emit({"type": "state_change", "state": state})
 
-    def _asr_problem(self, code: str) -> None:
+    def _on_asr_error(self, code: str, message: str) -> None:
+        """Transcriber problem (missing key, cloud disabled, stream failed). Rate-limited notice."""
         now = time.time()
         if now - self._asr_notice_at < _ASR_NOTICE_COOLDOWN:
             return
         self._asr_notice_at = now
-        if code == LOCAL_MODEL_REQUIRED:
-            message = ("Model ASR lokal belum tersedia. Unduh model Whisper di Setelan. "
-                       "Audio tidak dikirim ke cloud.")
-        else:
-            message = "Transkripsi lokal gagal. Audio tidak dikirim ke cloud."
         self._emit({"type": "asr_error", "code": code, "message": message})
 
     def _on_capture_error(self, source: TrackSource, code: str, message: str) -> None:

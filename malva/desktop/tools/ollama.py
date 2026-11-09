@@ -187,12 +187,12 @@ def _fetch_html(url: str) -> dict:
 # --------------------------------------------------------------------- web tools
 
 
-# The app wires this to PrivacyManager.cloud_processing. Until then it fails closed.
+# The app wires this to PrivacyManager.allows_cloud(). Until then it fails closed.
 _cloud_allowed = lambda: False
 
 
 def set_cloud_gate(fn) -> None:
-    """Connect web search to the cloud opt-in. Any query sent out is third-party processing."""
+    """Connect web search to the cloud policy (CLOUD_ENABLED). Queries sent out are cloud processing."""
     global _cloud_allowed
     _cloud_allowed = fn
 
@@ -203,11 +203,11 @@ def _require_cloud(what: str) -> None:
     except Exception:
         allowed = False
     if not allowed:
-        raise WebError(f"{what} memakai layanan cloud. Aktifkan 'Izinkan cloud' di tab Setelan.")
+        raise WebError(f"{what} memakai layanan cloud, tetapi CLOUD_ENABLED=false di .env.")
 
 
 def web_search(query: str, max_results: int = 5) -> dict:
-    """Cari di web. Prioritas API Ollama, fallback DuckDuckGo. Hanya dengan opt-in cloud.
+    """Cari di web. Prioritas API Ollama, fallback DuckDuckGo. Hanya jika cloud diizinkan (CLOUD_ENABLED).
 
     Return: {"query", "source", "results": [{"title","url","content"}]}
     """

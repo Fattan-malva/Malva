@@ -12,15 +12,15 @@ Key guarantees (Blueprint §4, §8; audit P0.1–P0.3):
   * Levels for the UI are real FFT band energies, tagged with their source.
   * Stereo loopback is downmixed to mono AFTER reading the real device format.
   * Pause keeps draining the stream (no stale buffers) and resets the bars.
+  * Audio leaves this module as a continuous 16 kHz mono PCM stream (on_pcm).
+    There is no utterance segmentation; the cloud transcriber does that.
 """
 
 from __future__ import annotations
 
-import io
 import threading
 import time
 import uuid
-import wave
 from enum import Enum
 from typing import Callable
 
@@ -53,24 +53,12 @@ CHUNK        = 1024
 FORMAT       = 8          # paInt16 (PortAudio constant; avoids importing pyaudio)
 TARGET_RATE  = 16000
 
-# VAD parameters (RMS on int16 scale; calibrated for laptop microphones)
+# Speech activity (RMS on int16 scale). Used only to reset the auto-sleep timer.
 SPEECH_THRESHOLD   = 45.0
-SILENCE_THRESHOLD  = 25.0
-SILENCE_DURATION   = 1.1     # seconds of silence that ends an utterance
-MAX_RECORD_SECONDS = 30.0
-PRE_BUFFER_CHUNKS  = 12      # ~0.4 s before speech onset
-MIN_SPEECH_SECONDS = 0.3
+SPEECH_TOUCH_INTERVAL = 1.0      # report activity at most once per second
 
 LEVELS_MIN_INTERVAL = 1.0 / 25.0   # UI update cap: 25 Hz
 MAX_CONSECUTIVE_READ_ERRORS = 25
-
-# Live (partial) text: a snapshot of the utterance so far is handed to the session
-# every PARTIAL_INTERVAL_SECONDS once PARTIAL_MIN_SECONDS of speech exists.
-PARTIAL_INTERVAL_SECONDS = 1.0
-PARTIAL_MIN_SECONDS      = 0.8
-# Live text decodes only the last few seconds. Decoding the whole utterance every second
-# costs more with each second of speech.
-PARTIAL_WINDOW_SECONDS  = 8.0
 
 
 class TrackSource(str, Enum):
@@ -93,11 +81,11 @@ class AudioTrack:
         self,
         source: TrackSource,
         session_id: str,
-        on_utterance: Callable[[bytes, "AudioTrack"], None],
+        on_pcm: Callable[[bytes, "AudioTrack"], None],
         on_levels: Callable[["TrackSource", list[float]], None] | None = None,
         on_error: Callable[["TrackSource", str, str], None] | None = None,
         device_index: int | None = None,
-        on_partial: Callable[[bytes, "AudioTrack"], None] | None = None,
+        on_speech: Callable[["TrackSource"], None] | None = None,
     ):
         self.track_id     = uuid.uuid4().hex
         self.source       = source
@@ -111,10 +99,10 @@ class AudioTrack:
         self.error_message = ""
         self.started_at: float | None = None
 
-        self._on_utterance = on_utterance
+        self._on_pcm       = on_pcm
         self._on_levels    = on_levels
         self._on_error     = on_error
-        self._on_partial  = on_partial
+        self._on_speech    = on_speech
         self._thread: threading.Thread | None = None
         self._stop_evt     = threading.Event()
         self._pa           = None
@@ -222,17 +210,9 @@ class AudioTrack:
     def _capture_loop(self) -> None:
         analyzer = SpectrumAnalyzer(sample_rate=self.sample_rate)
         last_levels_at = 0.0
+        last_speech_at = 0.0
         was_paused = False
-        pre_buffer: list[bytes] = []
-        frames: list[bytes] = []
-        speech_started = False
-        above_count = 0
-        silence_count = 0
-        silence_needed = max(1, int(SILENCE_DURATION * self.sample_rate / CHUNK))
-        min_frames = max(1, int(MIN_SPEECH_SECONDS * self.sample_rate / CHUNK))
-        record_start = 0.0
         read_errors = 0
-        last_partial_at = 0.0
 
         try:
             while not self._stop_evt.is_set():
@@ -254,9 +234,6 @@ class AudioTrack:
                 if self.state == TrackState.PAUSED:
                     if not was_paused:
                         was_paused = True
-                        pre_buffer.clear()
-                        frames.clear()
-                        speech_started = False
                         self._emit_levels(analyzer.reset(), force=True)
                     continue
                 was_paused = False
@@ -264,66 +241,30 @@ class AudioTrack:
                 mono = _to_mono_int16(raw, self.channels)
                 if mono.size == 0:
                     continue
-                rms = float(np.sqrt(np.mean(mono ** 2)))
 
                 now = time.time()
                 if self._on_levels and now - last_levels_at >= LEVELS_MIN_INTERVAL:
                     last_levels_at = now
                     self._emit_levels(analyzer.process(mono))
 
-                mono_bytes = mono.astype(np.int16).tobytes()
+                rms = float(np.sqrt(np.mean(mono.astype(np.float32) ** 2)))
+                if rms > SPEECH_THRESHOLD and self._on_speech and now - last_speech_at >= SPEECH_TOUCH_INTERVAL:
+                    last_speech_at = now
+                    self._on_speech(self.source)
 
-                if not speech_started:
-                    pre_buffer.append(mono_bytes)
-                    if len(pre_buffer) > PRE_BUFFER_CHUNKS:
-                        pre_buffer.pop(0)
-                    if rms > SPEECH_THRESHOLD:
-                        above_count += 1
-                        if above_count >= 2:
-                            speech_started = True
-                            frames = list(pre_buffer)
-                            pre_buffer.clear()
-                            record_start = time.time()
-                            last_partial_at = record_start
-                            above_count = 0
-                            silence_count = 0
-                    else:
-                        above_count = 0
-                    continue
-
-                frames.append(mono_bytes)
-                if self._on_partial is not None:
-                    now_p = time.time()
-                    if (now_p - last_partial_at >= PARTIAL_INTERVAL_SECONDS
-                            and len(frames) * CHUNK >= PARTIAL_MIN_SECONDS * self.sample_rate):
-                        last_partial_at = now_p
-                        self._emit_partial(frames)
-                elapsed = time.time() - record_start
-                if rms < SILENCE_THRESHOLD:
-                    silence_count += 1
-                else:
-                    silence_count = 0
-
-                if silence_count >= silence_needed or elapsed >= MAX_RECORD_SECONDS:
-                    if len(frames) >= min_frames:
-                        wav_bytes = self._frames_to_wav(frames, self.sample_rate)
-                        threading.Thread(
-                            target=self._on_utterance, args=(wav_bytes, self), daemon=True,
-                        ).start()
-                    frames = []
-                    speech_started = False
-                    silence_count = 0
+                pcm = self._to_target_rate(mono)
+                if pcm and self._on_pcm is not None:
+                    self._on_pcm(pcm, self)
         finally:
             self._close_device()
 
-    def _emit_partial(self, frames: list[bytes]) -> None:
-        """Hand a snapshot of the speech so far to the session. Never raises into the capture loop."""
-        try:
-            window = max(1, int(PARTIAL_WINDOW_SECONDS * self.sample_rate / CHUNK))
-            wav = self._frames_to_wav(list(frames[-window:]), self.sample_rate)
-            self._on_partial(wav, self)
-        except Exception as e:
-            print(f"[audio] partial hand-off failed: {e}")
+    def _to_target_rate(self, mono: np.ndarray) -> bytes:
+        """Mono int16 at the device rate → mono int16 PCM at 16 kHz."""
+        if self.sample_rate == TARGET_RATE:
+            return mono.astype(np.int16).tobytes()
+        from scipy.signal import resample_poly  # imported on first use to keep app startup light
+        resampled = resample_poly(mono.astype(np.float32), TARGET_RATE, self.sample_rate)
+        return np.clip(resampled, -32768, 32767).astype(np.int16).tobytes()
 
     def _emit_levels(self, levels: list[float], force: bool = False) -> None:
         if self._on_levels:
@@ -342,28 +283,6 @@ class AudioTrack:
                 self._on_error(self.source, code, message)
             except Exception as e:
                 print(f"[audio/{self.source.value}] error callback failed: {e}")
-
-    # ------------------------------------------------------------------ encoding
-
-    @staticmethod
-    def _frames_to_wav(frames: list[bytes], sample_rate: int) -> bytes:
-        """Mono int16 PCM → WAV (resampled to 16 kHz when scipy is available)."""
-        raw_pcm = b"".join(frames)
-        if sample_rate != TARGET_RATE:
-            try:
-                import scipy.signal as sg
-                arr = np.frombuffer(raw_pcm, dtype=np.int16).astype(np.float32)
-                raw_pcm = sg.resample_poly(arr, TARGET_RATE, sample_rate).astype(np.int16).tobytes()
-                sample_rate = TARGET_RATE
-            except Exception:
-                pass
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(sample_rate)
-            wf.writeframes(raw_pcm)
-        return buf.getvalue()
 
 
 # ------------------------------------------------------------------ helpers
@@ -419,16 +338,16 @@ class AudioEngine:
         self,
         session_id: str,
         mode: str,
-        on_utterance: Callable[[bytes, TrackSource, str], None],
+        on_pcm: Callable[[bytes, TrackSource, str], None],
         on_levels: Callable[[TrackSource, list[float]], None] | None = None,
         on_error: Callable[[TrackSource, str, str], None] | None = None,
         db=None,
-        on_partial: Callable[[bytes, TrackSource, str], None] | None = None,
+        on_speech: Callable[[TrackSource], None] | None = None,
     ):
         self.session_id    = session_id
         self.mode          = mode
-        self._on_utterance = on_utterance
-        self._on_partial   = on_partial
+        self._on_pcm       = on_pcm
+        self._on_speech    = on_speech
         self._on_levels    = on_levels
         self._on_error     = on_error
         self._db           = db
@@ -486,21 +405,17 @@ class AudioEngine:
             if existing is not None and existing.is_running:
                 return existing  # never create a duplicate stream
 
-        def on_track_utterance(wav_bytes: bytes, track: AudioTrack) -> None:
-            self._on_utterance(wav_bytes, track.source, self.session_id)
-
-        def on_track_partial(wav_bytes: bytes, track: AudioTrack) -> None:
-            if self._on_partial is not None:
-                self._on_partial(wav_bytes, track.source, self.session_id)
+        def on_track_pcm(pcm: bytes, track: AudioTrack) -> None:
+            self._on_pcm(pcm, track.source, self.session_id)
 
         track = AudioTrack(
             source=source,
             session_id=self.session_id,
-            on_utterance=on_track_utterance,
+            on_pcm=on_track_pcm,
             on_levels=self._on_levels,
             on_error=self._on_error,
             device_index=device_index,
-            on_partial=on_track_partial,
+            on_speech=self._on_speech,
         )
         track.start()  # raises AudioDeviceError; nothing registered on failure
 
