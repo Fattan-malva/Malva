@@ -162,6 +162,42 @@ def test_connection_failure_is_reported_not_raised():
     assert errors[0][0] == "asr-failed" and "tidak ada jaringan" in errors[0][1]
 
 
+def test_client_uses_v1beta_live_endpoint(monkeypatch):
+    """google-genai 3.x defaults to v1, where the Live API answers HTTP 404 for every model."""
+    import sys
+    from types import ModuleType
+
+    class HttpOptions:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    captured = {}
+
+    def client(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    google_mod = ModuleType("google")
+    genai_mod = ModuleType("google.genai")
+    types_mod = ModuleType("google.genai.types")
+    types_mod.HttpOptions = HttpOptions
+    genai_mod.types = types_mod
+    genai_mod.Client = client
+    google_mod.genai = genai_mod
+    monkeypatch.setitem(sys.modules, "google", google_mod)
+    monkeypatch.setitem(sys.modules, "google.genai", genai_mod)
+    monkeypatch.setitem(sys.modules, "google.genai.types", types_mod)
+
+    stream = GeminiLiveStream(
+        "microphone", api_key="k", model="m", language_codes=[],
+        on_partial=lambda t: None, on_final=lambda t: None, on_error=lambda c, m: None,
+        types_module=SimpleNamespace(HttpOptions=HttpOptions),
+    )
+    assert stream._make_client() is not None
+    assert captured["api_key"] == "k"
+    assert captured["http_options"].kwargs == {"api_version": "v1beta"}
+
+
 def test_language_codes_mapping_for_settings():
     assert language_codes_for("id") == ["id-ID"]
     assert language_codes_for("auto") == []

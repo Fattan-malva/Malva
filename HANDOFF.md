@@ -10,7 +10,7 @@
 
 - Transkripsi berjalan lewat **Gemini Live** (`gemini-3.5-transcribe-live`), satu stream per sumber audio.
 - Faster-whisper, SpeechRecognition, dan semua model lokal sudah dihapus.
-- Cloud disetujui untuk transkripsi (Gemini), AI (Ollama cloud), dan pencarian web. Satu saklar: `CLOUD_ENABLED` di `.env` (default `true`).
+- Cloud disetujui untuk transkripsi (Gemini), AI (Cloudflare Workers AI), dan pencarian web (DuckDuckGo). Satu saklar: `CLOUD_ENABLED` di `.env` (default `true`).
 - Semua tool desktop diberi izin otomatis. Hanya aksi hapus yang butuh persetujuan: klik di panel, atau ucapan dari mikrofon ("setuju" / "ya hapus" untuk setuju, "batal" untuk tolak). Persetujuan berlaku 120 detik.
 - Startup: pembukaan perangkat audio dipindah ke thread latar, dan `scipy` dimuat saat pertama dipakai.
 
@@ -71,7 +71,7 @@ Catatan lingkungan: di sandbox pengembangan, `httpx` tidak bisa dipasang dari Py
 
 ## 9. Konfigurasi
 
-Salin `.env.example` menjadi `.env`. Isi `GEMINI_API_KEY` untuk transkripsi, dan `OLLAMA_API_KEY` untuk AI. `CLOUD_ENABLED=false` mematikan semua cloud.
+Salin `.env.example` menjadi `.env`. Isi `GEMINI_API_KEY` untuk transkripsi, dan `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_API_TOKEN` untuk AI (Workers AI free tier). `CLOUDFLARE_MODEL` default `@cf/meta/llama-3.3-70b-instruct-fp8-fast`. `CLOUD_ENABLED=false` mematikan semua cloud.
 
 ## 10. Log dan diagnosa
 

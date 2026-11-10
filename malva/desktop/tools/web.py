@@ -1,7 +1,7 @@
-"""Tool web realtime untuk NANA.
+"""Tool web realtime untuk Malva.
 
-`web_search` memakai API web search Ollama (butuh internet + OLLAMA_API_KEY),
-dengan fallback DuckDuckGo. `web_fetch` membaca isi satu halaman.
+`web_search` memakai DuckDuckGo HTML (tanpa API key), dan `web_fetch` membaca isi
+satu halaman. Keduanya tetap butuh internet + CLOUD_ENABLED.
 
 Modul ini juga menyediakan deteksi "pertanyaan butuh info terbaru" supaya
 konteks web bisa disuntikkan otomatis sebelum model menjawab.
@@ -11,7 +11,7 @@ import os
 import re
 import time
 
-from . import ollama
+from . import web_backend
 
 _CACHE: dict[tuple, tuple[float, str]] = {}
 try:
@@ -63,8 +63,8 @@ def search_text(query: str, max_results=5) -> str:
         return cached
 
     try:
-        data = ollama.web_search(q, limit)
-    except ollama.WebError as e:
+        data = web_backend.web_search(q, limit)
+    except web_backend.WebError as e:
         raise WebToolError(str(e)) from e
 
     lines = [f'Hasil web untuk "{q}" ({data.get("source")}):']
@@ -93,8 +93,8 @@ def fetch_text(url: str) -> str:
         return cached
 
     try:
-        data = ollama.web_fetch(target)
-    except ollama.WebError as e:
+        data = web_backend.web_fetch(target)
+    except web_backend.WebError as e:
         raise WebToolError(str(e)) from e
 
     content = re.sub(r"\n{3,}", "\n\n", str(data.get("content") or "")).strip()

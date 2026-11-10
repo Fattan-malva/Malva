@@ -113,7 +113,8 @@ def test_llm_makes_no_http_call_when_cloud_disabled(monkeypatch):
 
     monkeypatch.setenv("CLOUD_ENABLED", "false")
     monkeypatch.setattr(orc.httpx, "Client", NoHttp)
-    monkeypatch.setattr(orc, "OLLAMA_URL", "https://ollama.com/v1/chat/completions")
+    monkeypatch.setattr(orc, "CLOUDFLARE_URL", "https://api.cloudflare.com/client/v4/accounts/x/ai/v1/chat/completions")
+    monkeypatch.setattr(orc, "CLOUDFLARE_API_TOKEN", "k")
     ai = orc.AIOrchestrator("s1", "assistant", db=None, privacy_manager=PrivacyManager())
     errors = []
     ai.on_error = errors.append
@@ -122,7 +123,7 @@ def test_llm_makes_no_http_call_when_cloud_disabled(monkeypatch):
 
 
 def test_web_search_blocked_when_cloud_disabled(monkeypatch):
-    from malva.desktop.tools import ollama as web_backend
+    from malva.desktop.tools import web_backend
 
     class NoHttp:
         def __init__(self, *a, **k):
@@ -138,17 +139,15 @@ def test_web_search_blocked_when_cloud_disabled(monkeypatch):
 
 
 def test_web_search_reaches_backend_when_cloud_enabled(monkeypatch):
-    from malva.desktop.tools import ollama as web_backend
+    from malva.desktop.tools import web_backend
 
-    seen = []
-    monkeypatch.setattr(web_backend, "_post_native", lambda path, payload, timeout=None: seen.append(path) or {"results": []})
     monkeypatch.setattr(web_backend, "_ddg_search", lambda q, n: [{"title": "t", "url": "https://x", "content": "c"}])
     web_backend.set_cloud_gate(lambda: True)
     try:
         out = web_backend.web_search("halo")
     finally:
         web_backend.set_cloud_gate(lambda: False)
-    assert seen == ["/api/web_search"] and out["results"]
+    assert out["source"] == "duckduckgo" and out["results"]
 
 
 # ------------------------------------------------------------------ approval: delete only

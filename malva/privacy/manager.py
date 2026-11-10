@@ -2,7 +2,7 @@
 malva.privacy.manager — Cloud policy and Hidden Mode (Blueprint §3, §11).
 
 Cloud processing is approved by product decision (Blueprint §3): speech recognition
-(Gemini), the LLM (Ollama cloud) and web search all use cloud services. The approval
+(Gemini), the LLM (Cloudflare Workers AI) and web search all use cloud services. The approval
 is a configuration value, not a per-user toggle, and it is visible in the Setelan tab.
 
   * CLOUD_ENABLED (default "true") is the only switch. Set it to "false" to block every

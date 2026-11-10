@@ -82,11 +82,12 @@ Malva has three product foundations:
                                       test phase.
 
   Cloud processing                    Approved for every service: speech
-                                      (Gemini), LLM (Ollama cloud), and
-                                      web search. Controlled by the
-                                      CLOUD_ENABLED setting, not by an
-                                      in-app opt-in. Revisit before
-                                      production (free-tier data use).
+                                      (Gemini), LLM (Cloudflare Workers
+                                      AI), and web search (DuckDuckGo).
+                                      Controlled by the CLOUD_ENABLED
+                                      setting, not by an in-app opt-in.
+                                      Revisit before production
+                                      (free-tier data use).
 
   Tool permissions                    All Windows-MCP tools are granted
                                       automatically. Only destructive

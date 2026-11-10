@@ -4,7 +4,7 @@ malva.ai.orchestrator — Central AI reasoning layer.
 Responsibilities:
 - Builds mode-specific prompts
 - Maintains conversation history per session
-- Calls the LLM (Ollama-compatible API, streaming)
+- Calls the LLM (Cloudflare Workers AI, OpenAI-compatible streaming)
 - Parses tool calls from LLM output
 - Streams text chunks to UI callback
 - Injects realtime web context when needed
@@ -25,10 +25,28 @@ import httpx
 
 from malva.storage.db import Database
 
-# Ollama cloud endpoint. Malva has no local LLM: this URL is always treated as cloud.
-OLLAMA_URL   = os.getenv("OLLAMA_URL", "")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:31b-cloud")
-OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
+# Cloudflare Workers AI, OpenAI-compatible endpoint. Malva has no local LLM: every
+# request is cloud processing. CLOUDFLARE_BASE_URL is only for an AI Gateway override.
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+CLOUDFLARE_API_TOKEN  = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+CLOUDFLARE_MODEL      = os.getenv(
+    "CLOUDFLARE_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+).strip()
+CLOUDFLARE_BASE_URL   = os.getenv("CLOUDFLARE_BASE_URL", "").strip().rstrip("/")
+
+
+def _chat_completions_url() -> str:
+    if CLOUDFLARE_BASE_URL:
+        if CLOUDFLARE_BASE_URL.endswith("/chat/completions"):
+            return CLOUDFLARE_BASE_URL
+        return f"{CLOUDFLARE_BASE_URL}/chat/completions"
+    if not CLOUDFLARE_ACCOUNT_ID:
+        return ""
+    return ("https://api.cloudflare.com/client/v4/accounts/"
+            f"{CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions")
+
+
+CLOUDFLARE_URL = _chat_completions_url()
 
 _MAX_HISTORY = 10   # pairs kept per session
 
@@ -99,8 +117,8 @@ class AIOrchestrator:
         self.on_error: Callable[[str], None] | None = None
         self._running   = True
         self._headers   = {"Content-Type": "application/json"}
-        if OLLAMA_API_KEY:
-            self._headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+        if CLOUDFLARE_API_TOKEN:
+            self._headers["Authorization"] = f"Bearer {CLOUDFLARE_API_TOKEN}"
 
     # ------------------------------------------------------------------ public
 
@@ -194,13 +212,15 @@ class AIOrchestrator:
     # ------------------------------------------------------------------ policy
 
     def _endpoint_allowed(self) -> bool:
-        """Every LLM request goes through here. The LLM is Ollama cloud only; fail closed."""
-        if not OLLAMA_URL.strip():
-            self._report_error("AI belum diatur. Isi OLLAMA_URL di file .env (endpoint Ollama cloud).")
+        """Every LLM request goes through here. The LLM is Cloudflare Workers AI only; fail closed."""
+        if not CLOUDFLARE_URL or not CLOUDFLARE_API_TOKEN:
+            self._report_error(
+                "AI belum diatur. Isi CLOUDFLARE_ACCOUNT_ID dan CLOUDFLARE_API_TOKEN di file .env."
+            )
             return False
         if self._privacy is None or not self._privacy.allows_llm():
             self._report_error(
-                "AI memakai Ollama cloud, tetapi CLOUD_ENABLED=false di .env."
+                "AI memakai Cloudflare Workers AI, tetapi CLOUD_ENABLED=false di .env."
             )
             return False
         return True
@@ -279,8 +299,8 @@ class AIOrchestrator:
         try:
             with httpx.Client(timeout=120.0) as client:
                 with client.stream(
-                    "POST", OLLAMA_URL, headers=headers,
-                    json={"model": OLLAMA_MODEL, "messages": messages, "stream": True},
+                    "POST", CLOUDFLARE_URL, headers=headers,
+                    json={"model": CLOUDFLARE_MODEL, "messages": messages, "stream": True},
                 ) as resp:
                     resp.raise_for_status()
                     for raw_line in resp.iter_lines():
@@ -338,8 +358,8 @@ class AIOrchestrator:
         try:
             with httpx.Client(timeout=120.0) as client:
                 resp = client.post(
-                    OLLAMA_URL, headers=self._headers,
-                    json={"model": OLLAMA_MODEL, "messages": messages, "stream": False},
+                    CLOUDFLARE_URL, headers=self._headers,
+                    json={"model": CLOUDFLARE_MODEL, "messages": messages, "stream": False},
                 )
                 resp.raise_for_status()
                 content = resp.json()["choices"][0]["message"]["content"]

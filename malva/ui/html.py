@@ -1355,7 +1355,7 @@ window._toggleHidden = function() {
 window.updatePrivacy = function(p) {
   S.cloud = !!(p && p.cloud_enabled);
   $('cloudStatus').innerHTML = S.cloud
-    ? '<strong>Diizinkan.</strong> <span class="privacy-warning">Audio, teks, dan pencarian web dikirim ke layanan cloud: Gemini (transkripsi), Ollama (AI), dan pencarian web.</span>'
+    ? '<strong>Diizinkan.</strong> <span class="privacy-warning">Audio, teks, dan pencarian web dikirim ke layanan cloud: Gemini (transkripsi), Cloudflare Workers AI (AI), dan DuckDuckGo (pencarian web).</span>'
     : '<strong>Dimatikan.</strong> Atur CLOUD_ENABLED=true di .env untuk mengizinkan. Transkripsi, AI, dan pencarian web tidak berjalan.';
 };
 

@@ -40,7 +40,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from malva.diagnostics import setup as _setup_diagnostics  # noqa: E402
-from malva.desktop.tools import ollama as _web_backend  # noqa: E402
+from malva.desktop.tools import web_backend as _web_backend  # noqa: E402
 LOG_PATH = _setup_diagnostics()
 
 import webview

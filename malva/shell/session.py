@@ -433,7 +433,7 @@ class MalvaSession:
         if question:
             self._practice_question = question
         else:
-            self._emit({"type": "notice", "message": "Pertanyaan belum bisa dibuat. Periksa AI cloud (OLLAMA_URL) dan CLOUD_ENABLED di .env."})
+            self._emit({"type": "notice", "message": "Pertanyaan belum bisa dibuat. Periksa Cloudflare Workers AI (CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN) dan CLOUD_ENABLED di .env."})
         return question
 
     def finish_practice(self) -> None:

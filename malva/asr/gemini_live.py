@@ -5,6 +5,8 @@ One GeminiLiveStream per audio source. Each stream runs its own asyncio loop in 
 background thread, so the capture thread only pushes bytes and never waits on the network.
 
 Contract, verified against the Gemini Live transcription docs:
+  * API version: v1beta. The Live API (BidiGenerateContent) is not served on v1, and
+    google-genai 3.x defaults to v1; connecting there fails with HTTP 404 for every model.
   * Model: gemini-3.5-transcribe-live (response_modalities=["TEXT"], so the model never
     speaks back and no audio output is billed).
   * Input: raw 16-bit PCM, 16 kHz, mono, sent as audio/pcm;rate=16000 chunks.
@@ -29,6 +31,7 @@ from typing import Any, Callable
 from malva.asr.types import ASR_FAILED, ASR_REJECTED
 
 MODEL_DEFAULT             = "gemini-3.5-transcribe-live"
+LIVE_API_VERSION          = "v1beta"   # BidiGenerateContent is not served on v1
 INPUT_RATE                = 16000
 SESSION_ROTATE_SECONDS    = 9 * 60     # API limit is 10 minutes; rotate a minute early
 MAX_QUEUED_CHUNKS         = 300        # about 19 s of 64 ms chunks
@@ -238,7 +241,12 @@ class GeminiLiveStream:
         if self._client_factory is not None:
             return self._client_factory()
         from google import genai
-        return genai.Client(api_key=self._api_key)
+        # google-genai 3.x defaults to v1, which has no Live API endpoint: the WebSocket
+        # handshake is rejected with HTTP 404 even when the model and key are valid.
+        return genai.Client(
+            api_key=self._api_key,
+            http_options=self._types().HttpOptions(api_version=LIVE_API_VERSION),
+        )
 
     def _config(self) -> Any:
         t = self._types()
